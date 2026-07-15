@@ -135,13 +135,13 @@ struct RankPlan {
 };
 
 bool LaunchRank(const RankPlan& p, bool transX2, int64_t remoteStart, int64_t remoteCount, int64_t wfM, int64_t wfN,
-                int64_t commCores, int64_t commKTiles, aclrtStream stream, void** wsOut) {
+                int64_t commCores, int64_t commKTiles, bool enDCopyback, aclrtStream stream, void** wsOut) {
   uint64_t wsSize = 0;
   aclOpExecutor* exec = nullptr;
   aclError ret = aclnnTileletMatmulFp32GetWorkspaceSize(
       p.x1, p.x2, /*bias=*/nullptr, p.arena, p.peerOut, p.peerDsignal,
       /*transposeX1=*/false, transX2, remoteStart, remoteCount, wfM, wfN, commCores, commKTiles,
-      /*enableDCopyback=*/false, p.role, p.rankId, /*worldSize=*/2, p.out, &wsSize, &exec);
+      enDCopyback, p.role, p.rankId, /*worldSize=*/2, p.out, &wsSize, &exec);
   if (!Check(ret, "GetWorkspaceSize")) return false;
   void* ws = nullptr;
   if (wsSize != 0 && !Check(aclrtMalloc(&ws, wsSize, ACL_MEM_MALLOC_HUGE_FIRST), "malloc ws")) return false;
@@ -167,6 +167,7 @@ int main() {
   const int64_t wfN = EnvI64("TILELET_WAVEFRONT_N", 8);
   const int64_t commCores = EnvI64("TILELET_COMM_CORE_NUM", EnvI64("TILELET_COMM_SMS", 8));
   const int64_t commKTiles = EnvI64("TILELET_COMM_K_TILES", 32);
+  const bool enableDCopyback = EnvFlag("TILELET_D_COPYBACK", false);
   const int64_t remoteStart = EnvI64("TILELET_REMOTE_TILE_START", 2);
   const int64_t remoteCount = EnvI64("TILELET_REMOTE_TILE_COUNT", 2);
 
@@ -183,7 +184,7 @@ int main() {
   pp.k = static_cast<uint64_t>(K);
   pp.elemSize = elem;
   pp.transposeX2 = transX2;
-  pp.enableDCopyback = false;
+  pp.enableDCopyback = enableDCopyback;
   pp.wavefrontM = static_cast<uint64_t>(wfM);
   pp.wavefrontN = static_cast<uint64_t>(wfN);
   pp.commCoreNum = static_cast<uint64_t>(commCores);
@@ -283,12 +284,14 @@ int main() {
   // Launch source (dev0) and compute (dev1) concurrently, then sync both.
   if (!Check(aclrtSetDevice(kSourceDevice), "setDevice src launch")) return 1;
   RankPlan src{tX1s, tX2s, tArena, /*peerOut=*/nullptr, tDsignalSrc, tCSource, /*role=*/0, /*rankId=*/0};
-  if (!LaunchRank(src, transX2, remoteStartUse, remoteCountUse, wfM, wfN, commCores, commKTiles, streamSrc, &wsSrc))
+  if (!LaunchRank(src, transX2, remoteStartUse, remoteCountUse, wfM, wfN, commCores, commKTiles, enableDCopyback,
+                  streamSrc, &wsSrc))
     return 1;
 
   if (!Check(aclrtSetDevice(kComputeDevice), "setDevice compute launch")) return 1;
   RankPlan cmp{tX1c, tX2c, tArena, tPeerOut, tDsignalCmp, tOutDummy, /*role=*/1, /*rankId=*/1};
-  if (!LaunchRank(cmp, transX2, remoteStartUse, remoteCountUse, wfM, wfN, commCores, commKTiles, streamCompute, &wsCompute))
+  if (!LaunchRank(cmp, transX2, remoteStartUse, remoteCountUse, wfM, wfN, commCores, commKTiles, enableDCopyback,
+                  streamCompute, &wsCompute))
     return 1;
 
   if (!Check(aclrtSetDevice(kSourceDevice), "setDevice src sync")) return 1;

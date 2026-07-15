@@ -113,6 +113,7 @@ protected:
     GlobalTensor<C_T> dStageGlobal_;
     GlobalTensor<uint32_t> abSignalGlobal_;
     GlobalTensor<uint32_t> dSignalGlobal_;
+    GlobalTensor<uint32_t> peerDsignalGlobal_;  // cross-card "C tile ready" flag on the source card
     TBuf<QuePosition::VECCALC> copyBuf_;
     TPipe* pipe_;
     bool crossCard_ = false;      // arena provided => cooperative two-card execution
@@ -182,17 +183,22 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
                                     abSignalSlots * TILELET_MATMUL_FP32_SIGNAL_WORD_STRIDE);
     dSignalGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(userWorkspace + tilelet.dSignalByteOffset),
                                    dSignalSlots * TILELET_MATMUL_FP32_SIGNAL_WORD_STRIDE);
-    // In-kernel cross-card D-done handshake: when a peer-visible D-done buffer on
-    // the SOURCE card is supplied, the D signals live there instead of in the
-    // (compute-card) arena. The compute rank raises D-done with a peer write to
-    // the same card as C — ordered after the C write — and the source rank waits
-    // on it locally, so source-stream completion implies C is fully assembled
-    // without relying on host stream-sync (see ProcessCrossCard*). Host zeroes it.
+    // In-kernel cross-card D-done handshake. dSignalGlobal_ ALWAYS stays in the
+    // (compute-card) arena: it carries the compute-local producer/consumer signals
+    // — the AIC "remote tile staged into dStage" flags and the AIV copyback
+    // DCopyDone flags (both live entirely on the compute card, single-card layout).
+    // peerDsignalGlobal_ is the separate cross-card "C tile ready" flag that lives
+    // on the SOURCE card (peer_dsignal): whoever writes a remote C tile to the
+    // source card (AIC for direct-D, AIV after copyback) raises it there with a
+    // peer write ordered after the C write, and the source rank polls it in-kernel
+    // so source-stream completion implies C is assembled without host stream-sync.
+    // Host zeroes both buffers. When peer_dsignal is absent it falls back to the
+    // local region (unused), preserving the pre-D-done behavior.
     dDoneCrossCard_ = crossCard_ && (peerDsignalGM != nullptr);
-    if (dDoneCrossCard_) {
-        dSignalGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(peerDsignalGM),
-                                       dSignalSlots * TILELET_MATMUL_FP32_SIGNAL_WORD_STRIDE);
-    }
+    peerDsignalGlobal_.SetGlobalBuffer(
+        reinterpret_cast<__gm__ uint32_t*>(dDoneCrossCard_ ? peerDsignalGM
+                                                           : (userWorkspace + tilelet.dSignalByteOffset)),
+        dSignalSlots * TILELET_MATMUL_FP32_SIGNAL_WORD_STRIDE);
     aStageGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(userWorkspace + tilelet.aSlabByteOffset),
                                   tilelet.wavefrontRows * tilelet.aSlabElements);
     bStageGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(userWorkspace + tilelet.bSlabByteOffset),
@@ -721,7 +727,7 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
                 if (!DecodeCompactSlot(slot, wfIndex, localM, localN, mTile, nTile)) {
                     continue;
                 }
-                while (ReadSignal(dSignalGlobal_, slot) == 0) {
+                while (ReadSignal(peerDsignalGlobal_, slot) == 0) {
                 }
             }
         }
@@ -733,15 +739,23 @@ template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK
 __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG,
                                                    MM_CB>::ProcessCrossCardCompute()
 {
-    // Compute rank: AIC cores wait for each remote wavefront's A/B to arrive in
-    // the arena (AB signals raised by the source), read the staged A/B locally,
-    // and write the remote tiles directly into the source card's C (cGlobal_ was
-    // retargeted to peer_out). Host-level stream sync of both ranks gates
-    // completion, so no D-done signalling is required here.
+    // Compute rank. AIC cores wait each remote wavefront's A/B (AB signals raised
+    // by the source) and produce the remote tiles:
+    //  - direct-D wavefront: write straight into the source card's C (cGlobal_ was
+    //    retargeted to peer_out) and raise the cross-card D-done there.
+    //  - copyback wavefront (enable_d_copyback, all but the last remote wavefront):
+    //    write into the local dStage and raise the compute-local dSignal; the AIV
+    //    comm cores then DMA dStage -> source C and raise the cross-card D-done.
+    // Mirrors the single-card split (ProcessComputeCoreRemote + ProcessCommCopyBack)
+    // with the copyback destination redirected across the card link.
+    const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
     if ASCEND_IS_AIV {
+        if (tilelet.enableDCopyback != 0 && tilelet.commCoreNum > 0 && GetSubBlockIdx() == 0 &&
+            GetCurrentBlockIdx() < tilelet.commCoreNum) {
+            ProcessCommCopyBack(GetCurrentBlockIdx());
+        }
         return;
     }
-    const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
     const uint64_t computeIdx = GetCurrentBlockIdx();
     for (uint64_t slot = computeIdx; slot < tilelet.compactTileSlots; slot += tilelet.computeCoreNum) {
         uint64_t wfIndex = 0;
@@ -753,12 +767,21 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
             continue;
         }
         WaitAbSignalForWavefront(wfIndex);
-        ComputeRemoteTileDirectD(wfIndex, localM, localN, mTile, nTile);
-        // Raise this tile's D-done on the source card AFTER its C write. The
-        // barrier drains the fixpipe C peer-write; because the D-done word also
-        // lives on the source card, the two peer writes are ordered, so the
-        // source observing D-done implies its C tile has landed.
-        if (dDoneCrossCard_) {
+        if (IsDirectDWavefront(wfIndex)) {
+            ComputeRemoteTileDirectD(wfIndex, localM, localN, mTile, nTile);
+            // Raise this tile's D-done on the source card AFTER its C write. The
+            // barrier drains the fixpipe C peer-write; because the D-done word also
+            // lives on the source card, the two peer writes are ordered, so the
+            // source observing D-done implies its C tile has landed.
+            if (dDoneCrossCard_) {
+                PipeBarrier<PIPE_ALL>();
+                WriteSignal(peerDsignalGlobal_, slot, 1);
+            }
+        } else {
+            // Copyback tile: stage into the local dStage and hand off to the AIV
+            // comm cores via the compute-local dSignal (D-done is raised by AIV
+            // after the cross-card copyback completes).
+            ComputeRemoteTile(wfIndex, localM, localN, mTile, nTile);
             PipeBarrier<PIPE_ALL>();
             WriteSignal(dSignalGlobal_, slot, 1);
         }
@@ -1045,6 +1068,14 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
         }
         if (remoteOrdinal % tilelet.commCoreNum == coreIdx) {
             CopyBackRemoteTile(slotWf, localM, localN, mTile, nTile);
+            // Cross-card: this comm core just wrote the tile into the source card's
+            // C over the link; raise its D-done on the source card (ordered after
+            // the copy, same destination card) so the source rank's in-kernel poll
+            // sees it. Single-card copyback leaves this to the DCopyDone counters.
+            if (dDoneCrossCard_) {
+                PipeBarrier<PIPE_ALL>();
+                WriteSignal(peerDsignalGlobal_, slot, 1);
+            }
         }
         ++remoteOrdinal;
     }

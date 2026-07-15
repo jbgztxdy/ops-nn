@@ -121,3 +121,29 @@ target_link_libraries(execute_tilelet_matmul_fp32_crosscard
 )
 
 install(TARGETS execute_tilelet_matmul_fp32_crosscard DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+
+# Two-PROCESS cross-card gate: source/compute run as separate processes sharing
+# device buffers via the ACL IPC-mem key API (framework-integration de-risk).
+add_executable(execute_tilelet_matmul_fp32_crosscard_mp
+    ${OPS_NN_RESOURCE_CPP}
+    tilelet_static_resource_stub.cpp
+    main_crosscard_mp.cpp
+)
+
+target_link_libraries(execute_tilelet_matmul_fp32_crosscard_mp
+    ${OPS_NN_STATIC_LIB}
+    metadef
+    c_sec
+    opp_registry
+    register
+    ascendalog
+    tiling_api
+    platform
+    nnopbase
+    opapi_math
+    ascendcl
+    acl_op_compiler
+    stdc++
+)
+
+install(TARGETS execute_tilelet_matmul_fp32_crosscard_mp DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})

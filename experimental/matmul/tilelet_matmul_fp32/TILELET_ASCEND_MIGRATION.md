@@ -254,6 +254,16 @@ env TILELET_DTYPE=bf16 python3 scripts/verify_result.py output/output_z.bin outp
   `peer_dsignal`（在 `peer_out` 与 `transposeX1` 之间）；kernel 入口、`Init/InitInputs`、bl1 kernel、
   `op_runner.cpp` 均已对齐。
 
+- **任务3「跨卡 copyback」完成**：`enable_d_copyback=true` 下，compute rank 的 **AIC** 把非直写
+  wavefront 的 remote tile 写入本地 `dStage`（arena）并置 **compute-local** `dSignalGlobal_`（仍在 arena）；
+  compute rank 的 **AIV** comm core 走 `ProcessCommCopyBack`：等该 signal → `CopyBackRemoteTile` 把 dStage
+  跨卡 DMA 回 source C（`cGlobal_` 已重定向到 peer_out）→ 置 `peerDsignalGlobal_` 的 D-done。**最后一个
+  remote wavefront 仍 direct-D**（`IsDirectDWavefront`，对齐 CUDA `direct_d_wavefront_begin=last,count=1`）。
+  为此把 D 信号拆成两块：`dSignalGlobal_`（compute 卡 arena，AIC↔AIV 本地握手 + DCopyDone）与
+  `peerDsignalGlobal_`（source 卡 peer_dsignal，跨卡「C tile ready」，direct-D 由 AIC 置、copyback 由 AIV 置）。
+  缺省 `d_copyback=false` 时全部不触发。910C 实测通过：多 wavefront 2176×2304×8、copyback+多 K-group
+  (kt=1,K=64)、copyback+ratio[0,0.6]，均 `error ratio 0.0000, test pass`；direct-D 与单卡回归不变。
+
 **910C 仍缺（本轮受限）**：`msprof` 性能/overlap（任务1）与 vLLM 级大 shape 实测（任务2 尾巴）——本机 16 die
 被生产 `vllm serve GLM-5.1` 占满 HBM（每 die ~62/64GB），只够跑小 shape 正确性 gate；且共享机上 profiling
 噪声大、会挤生产任务。需空闲卡后再做。（vLLM 16384×28672×28672 经 `tilelet_host_layout.h` 估算 arena≈3.3GB。）
@@ -275,8 +285,10 @@ env TILELET_DTYPE=bf16 python3 scripts/verify_result.py output/output_z.bin outp
 3. **补齐 v1 相对 CUDA 的简化**：
    - ✅ **in-kernel 跨卡 D-done 轮询（本轮完成）**：见上「第三阶段」。经可选输入 `peer_dsignal`（source 卡、
      compute peer 可见）实现，source kernel 内轮询、不再依赖 host 同步做正确性；缺省不传则回落旧行为。
-   - ❌ **copyback 路径（d_copyback=true）跨卡未验证**：只做了 direct-D。若 benchmark 之外要支持 copyback，
-     `CopyBackRemoteTile / CopyBackRemoteWavefront / dStage` 需要在跨卡布局下重新走通。
+   - ✅ **copyback 路径（d_copyback=true）跨卡（本轮完成）**：见下「第三阶段」补充。compute AIC 把 remote tile
+     写本地 dStage + 置 compute-local dSignal；compute AIV comm core 等该 signal 后把 dStage 跨卡 DMA 回
+     source C 并置 D-done；**最后一个 remote wavefront 仍走 direct-D**（对齐 CUDA `direct_d_wavefront_begin`）。
+     缺省 `d_copyback=false` 时该路径完全不触发（direct-D 与单卡回归均 `test pass`）。
    - ❌ **arena 分配器**：目前测试驱动直接 `aclrtMalloc` 一块 peer 可见 buffer（大小已按 `arenaBytes` 精确）；
      真接入要一个 peer 可见分配器（对应 CUDA same-VA allocator），处理生命周期与多算子复用——归入框架层。
 
@@ -288,26 +300,67 @@ env TILELET_DTYPE=bf16 python3 scripts/verify_result.py output/output_z.bin outp
    （对应 `tilelet_multiprocess_gemm.cu`）+ ratio→tile 映射 + peer access 使能 + 接到 `vllm/vllm/tilelet.py`
    的 NPU `remote_linear`。这是一层真实框架代码，不是改几个参数。
 
-## 需要进一步和 CUDA tilelet 对齐 / 核对的点
+## 与 CUDA tilelet 的逐行比对结论（2026-07 已完成）
 
-在 910C 上建议逐条对照 `tilelet-sched/cutlass/...` 源码核实（本轮是复用单卡机制 + 端到端数值验证，
-未逐字节比对 CUDA）：
+已把下列点**逐行**对照 `tilelet-sched/cutlass/...` 源码（此前只是数值验证）。结论：**核心机理逐行一致**，
+差异都是正确性无关的（硬件/坐标系/调度策略）。每条给出源码位置。
 
-- **copy 顺序**：`cutlass/include/cutlass/gemm/device/tilelet_remote_copy.h` 的 `ordered_sig` 遍历、
-  A-row / B-col 的先后与切分，对照 `base_kernel.h` 的 `ProcessCommCopyIn` / `CopySignalAB` /
-  `SignalOrigin` / `SignalForA` / `SignalForB`。
-- **K-group signal 粒度**：`cutlass/include/cutlass/gemm/kernel/tilelet_gemm.h` 里 `k_iteration_signals`、
-  `group_count`、`wait_sig` 的算法，对照 `AbSignalIndex` / `kGroupCount` / `WaitAbSignalForWavefront`。
-- **remote CTA 范围**：CUDA `tilelet_gemm.h` 用 `cta_begin/cta_count/wavefront_begin`、
-  `reverse_wavefront_order` 切范围；Ascend 用 `remote_tile_start/count` + `DecodeCompactSlot`。确认
-  compact slot 的编号顺序（`groupM/groupN=2` 分块）与 CUDA 的 tile 线性化一致。
-- **direct-D 写回**：CUDA `params_direct_D` vs `ComputeRemoteTileDirectD` 写 `cGlobal_`(=peer_out) 的
-  offset（`mStart*N + nStart`）。
-- **数值累加/取整**：BF16 输入、FP32 累加的取整与 CUDA epilogue 是否一致（当前 golden 是 FP32 参考，
-  容差 1e-3 通过；大 shape 下需复核累加误差）。
+**逐行一致：**
+- **A/B signal 映射**：`SignalForA`=wfRow、`SignalForB`=wavefrontRows-1+wfCol（`base_kernel.h:439/448`）
+  == `signal_for_a/b_wavefront` 非转置分支（`tilelet_gemm.h:199/210`、`tilelet_remote_copy.h:772/782`）。
+- **signal 起点 / 需否拷贝**：`SignalOrigin`/`SignalNeededForRemoteTiles`（`base_kernel.h:458/474`）
+  == `signal_wavefront_origin`/`signal_needed_for_wavefront_range`（`tilelet_remote_copy.h:792/814`）。
+- **copy 顺序 / A行B列**：`ProcessCommCopyIn`+`CopySignalAB`（`wfCol==0` 拷 A、`wfRow==0` 拷 B）
+  （`base_kernel.h:626/848/853`）== `ordered_sig` 循环 `need_a=(wf_col==0)`、`need_b=(wf_row==0)`
+  （`tilelet_remote_copy.h:1140/1162/1163`）。
+- **K-group signal 粒度**：`AbSignalIndex=sig*kGroupCount+group`、`kGroupCount=ceil(kTiles/commKTiles)`
+  （`base_kernel.h:400`）== `signals[sig_idx*group_count+group]`、`group_count=ceil(k_tile/interval)`
+  （`tilelet_gemm.h:450/453`）。等待逻辑 `waitSig=max(sigA,sigB)`（`base_kernel.h:507`）也一致。
+- **完成→发布两阶段协议**：每 worker 写 completion、汇总后发 (sig,group) 信号
+  （`base_kernel.h:638-644` vs `tilelet_remote_copy.h:1200-1215`）——结构一致。
+- **compact slot → tile 线性化**：`DecodeCompactSlot`（groupM/N=2 分块 + 可整除/回退两分支，
+  `base_kernel.h:288-337`）与 `get_wavefront_local_tile_offset`（`threadblock_swizzle.h:365-411`）
+  **逐字节一致**（仅变量名 innerN↔local_n 之差）。
+
+**差异（正确性无关，需知晓）：**
+1. **remote tile 放置**：CUDA compute rank 可用 `reverse_wavefront_order` 取尾部 wavefront
+   （`tilelet_multiprocess_gemm.cu:1207`、`tilelet_remote_gemm.h:1074`）；Ascend 用前缀
+   `remote_tile_start=0..count`。→ **compact slot 编号完全一致**，只是"哪几块归 remote"的选择不同，
+   切分大小与最终 C 相同；Ascend 未实现 `reverse_wavefront_order`（不需要）。
+2. **transpose_signal_mapping**：Ascend 固定 false；CUDA remote 路径默认也 false。一致。
+3. **区域内拷贝微观粒度**：CUDA per-thread `cp.async`/LDG 混合；Ascend per-row `DataCopy` 经 UB。
+   覆盖相同、微观分工不同（硬件差异，预期）。
+4. **direct-D 写回坐标系**：CUDA 列主序（`ldc=tilelet_m`，TN 交换坐标）；Ascend 行主序
+   `output[M,N]`（`cGlobal_[mStart*N+nStart]`）。都产出正确 `output[M,N]`（golden 验证），设计上非逐字节可比。
+5. **数值累加/取整**：两边都 FP32 累加；epilogue 硬件不同（cube vs tensor core），容差内等价。
+   **唯一仍需真机大 shape 复核**：大 K 累加误差（受限于共享机 HBM，见上）。
+
+## 接口一致性（算子设置 vs CUDA tilelet）
+
+CUDA 的功能开关分两层：**host 调度层**（`remote_linear(...)` 的 ratio / rank / prefix）和 **kernel 参数层**
+（`TileletMultiprocessGemm::Arguments`：`compute_ctas`/`comm_sms`/`comm_k_tiles`/`enable_d_copyback`/`config`）。
+Ascend 算子对应的是 **kernel 参数层**；ratio 那层是框架职责（CUDA 里也是 host 先把 ratio 折成 `cta_begin/count`
+再进 kernel，见 `ScheduleRemoteLinear`）。逐项对照：
+
+| 功能 | CUDA（kernel 层） | Ascend 算子 attr/input | 一致性 |
+|---|---|---|---|
+| **是否 copyback** | `enable_d_copyback`（默认 false） | `enable_d_copyback`（默认 false） | ✅ **名称/默认/语义完全一致** |
+| comm 核数 | `comm_sms` | `comm_core_num`（默认 8） | ⚠️ 语义一致，名称不同（Ascend 用 AIV core，非 SM）；env 层已统一为 `TILELET_COMM_SMS` |
+| K 分组 | `comm_k_tiles` | `comm_k_tiles`（默认 32） | ✅ 完全一致 |
+| remote 块数 | `compute_ctas`（host 由 ratio 折算） | `remote_tile_start`/`remote_tile_count`（host 由 ratio 折算，见 `tilelet_host_layout.h`） | ✅ 结构一致（kernel 层都是具体块数，ratio 在 host） |
+| wavefront 形状 | 模板 `WavefrontM/N`（16/8） | attr `wavefront_m`/`wavefront_n`（16/8） | ✅ 默认一致（Ascend 做成运行期 attr，更灵活） |
+| 两 rank | `source_rank`/`compute_rank` | `role`/`rank_id`/`world_size` | ⚠️ 模型不同（Ascend 两次 launch 用 role 区分） |
+| 布局/转置 | `GemmLayoutMode::kLinearTN` | `transpose_x1`/`transpose_x2` | ✅ `transpose_x2=1` 表达 `x1@x2^T` |
+| dtype | bf16（vLLM 强制） | x1/x2/y dtype（bf16/fp32） | ✅ bf16 路径一致 |
+
+结论：**决定"做什么"的功能开关（尤其 copyback、comm_k_tiles、wavefront、ratio 折算方式）与 CUDA 一致**；
+唯一实质差异是命名 `comm_core_num`↔`comm_sms`（Ascend 上 SM 术语不准确，故保留 core 命名，env 层已用
+`TILELET_COMM_SMS` 对齐）与两 rank 表达方式（role vs rank——源于 Ascend 两次单算子 launch 的设计）。
+CUDA 特有的 `worker_green_sms`（green context 分核）无 Ascend 对应，属框架层性能旋钮。
 
 ## 当前边界（一句话）
 
-**核心计算算子迁移已完成并在 910B 跨卡验证通过**（能跑、真跨卡、拷贝顺序/signal 逻辑与 CUTLASS 对齐、
-多 wavefront/K-group 均过、覆盖 benchmark 核心配置）。**整体迁移尚未完成**：缺性能/overlap 验证、大 shape
-实测、几处 v1 简化补齐、ratio→tile 映射、以及一层跨卡编排/框架接入。
+**核心计算算子已在 910C 迁移完成并跨卡验证通过**（拷贝顺序/signal 逻辑/slot 线性化与 CUTLASS 逐行一致，
+in-kernel D-done 与 ratio→tile 已补齐，多 wavefront/K-group 均过，覆盖 benchmark 核心配置）。**尚缺**：
+910C overlap 性能 profiling、vLLM 级大 shape 实测（均卡在共享机空闲卡）、跨卡 copyback（benchmark 外）、
+以及跨卡编排/框架接入层。
