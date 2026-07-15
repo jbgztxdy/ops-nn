@@ -35,8 +35,10 @@ class Const:
 
 def shell_exec(cmd, shell=False):
     try:
-        ps = subprocess.Popen(cmd, shell)
-        ps.communicate(timeout=180)
+        # NB: the original `subprocess.Popen(cmd, shell)` passed `shell` as the
+        # positional `bufsize` argument (bufsize=0), which under newer Python
+        # corrupts the child's fds (objcopy: "Bad file descriptor"). Use run().
+        subprocess.run(cmd, shell=shell, timeout=180, check=True)
     except BaseException as e:
         log.error(f"shell_exec error: {e}")
         sys.exit(1)
@@ -164,6 +166,9 @@ class CompileOpStaticLib:
             return num
 
         job_num = get_parallel_num()
+        # Force serial packaging: the parallel objcopy/ld path races on shared
+        # fds here ("Bad file descriptor"), leaving data_*.o / part.o incomplete.
+        job_num = 1
         for op in self.ops_compile_files:
             compile_files = self.ops_compile_files[op].kernel_files
             json_files = self.ops_compile_files[op].binary_config_files

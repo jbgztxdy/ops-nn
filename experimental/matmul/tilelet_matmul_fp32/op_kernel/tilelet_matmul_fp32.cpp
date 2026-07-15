@@ -34,32 +34,32 @@ constexpr CubeFormat format_y = CubeFormat::ND;
             using aType = MatmulType<AscendC::TPosition::GM, aFormat, D_T, false>;                         \
             using bType = MatmulType<AscendC::TPosition::GM, format_x2, D_T, false>;                       \
             templateClass<aType, bType, cType, biasType, __VA_ARGS__> op;                                  \
-            op.Init(aGM, bGM, cGM, biasGM, user, &tilingData, &pipe);                                      \
+            op.Init(aGM, bGM, cGM, biasGM, user, arenaGM, peerOutGM, &tilingData, &pipe);                  \
             op.Process();                                                                                  \
         } else if (tilingData.matmulFp32RunInfo.transA == 1 && tilingData.matmulFp32RunInfo.transB == 0) { \
             using aType = MatmulType<AscendC::TPosition::GM, aFormat, D_T, true>;                          \
             using bType = MatmulType<AscendC::TPosition::GM, format_x2, D_T, false>;                       \
             templateClass<aType, bType, cType, biasType, __VA_ARGS__> op;                                  \
-            op.Init(aGM, bGM, cGM, biasGM, user, &tilingData, &pipe);                                      \
+            op.Init(aGM, bGM, cGM, biasGM, user, arenaGM, peerOutGM, &tilingData, &pipe);                  \
             op.Process();                                                                                  \
         } else if (tilingData.matmulFp32RunInfo.transA == 0 && tilingData.matmulFp32RunInfo.transB == 1) { \
             using aType = MatmulType<AscendC::TPosition::GM, aFormat, D_T, false>;                         \
             using bType = MatmulType<AscendC::TPosition::GM, format_x2, D_T, true>;                        \
             templateClass<aType, bType, cType, biasType, __VA_ARGS__> op;                                  \
-            op.Init(aGM, bGM, cGM, biasGM, user, &tilingData, &pipe);                                      \
+            op.Init(aGM, bGM, cGM, biasGM, user, arenaGM, peerOutGM, &tilingData, &pipe);                  \
             op.Process();                                                                                  \
         } else {                                                                                           \
             using aType = MatmulType<AscendC::TPosition::GM, aFormat, D_T, true>;                          \
             using bType = MatmulType<AscendC::TPosition::GM, format_x2, D_T, true>;                        \
             templateClass<aType, bType, cType, biasType, __VA_ARGS__> op;                                  \
-            op.Init(aGM, bGM, cGM, biasGM, user, &tilingData, &pipe);                                      \
+            op.Init(aGM, bGM, cGM, biasGM, user, arenaGM, peerOutGM, &tilingData, &pipe);                  \
             op.Process();                                                                                  \
         }                                                                                                  \
     } while (0)
 
 template <typename D_T, int LOADMODE, int SPLITCOREMODE, int FIXOPTI, int MIXND2NZ>
-__global__ __aicore__ void tilelet_matmul_fp32(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR biasGM, GM_ADDR cGM, GM_ADDR workspaceGM,
-                                       GM_ADDR tilingGM)
+__global__ __aicore__ void tilelet_matmul_fp32(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR biasGM, GM_ADDR arenaGM,
+                                       GM_ADDR peerOutGM, GM_ADDR cGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
 {
     REGISTER_TILING_DEFAULT(TileletMatmulFp32TilingData);
     GET_TILING_DATA_WITH_STRUCT(TileletMatmulFp32TilingData, tilingData, tilingGM);

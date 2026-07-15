@@ -49,6 +49,14 @@ struct TileletMatmulFp32TileletInfo {
     uint64_t bSlabByteOffset;
     uint64_t dSlabByteOffset;
     uint64_t userWorkspaceBytes;
+    // Cross-card ("peer 直存") coordination. role: 0 = single-card/source,
+    // 1 = remote compute rank. arenaBytes is the size of the shared peer-visible
+    // staging/signal buffer (identical layout on both ranks for a given shape).
+    uint32_t role;
+    uint32_t rankId;
+    uint32_t worldSize;
+    uint32_t reserved;
+    uint64_t arenaBytes;
 };
 
 struct TileletMatmulFp32TilingData {

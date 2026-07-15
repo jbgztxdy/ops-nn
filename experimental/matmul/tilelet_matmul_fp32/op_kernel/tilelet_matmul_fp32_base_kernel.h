@@ -30,10 +30,16 @@ public:
     __aicore__ inline TileletMatmulFp32BaseKernel(){};
 
     __aicore__ inline void Init(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR biasGM, GM_ADDR workspaceGM,
-                                const void* tilingData, TPipe* pipe);
+                                GM_ADDR arenaGM, GM_ADDR peerOutGM, const void* tilingData, TPipe* pipe);
 
-    __aicore__ inline void InitInputs(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR biasGM, GM_ADDR workspaceGM);
+    __aicore__ inline void InitInputs(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR biasGM, GM_ADDR workspaceGM,
+                                      GM_ADDR arenaGM, GM_ADDR peerOutGM);
     __aicore__ inline void Process(uint64_t index = 0, uint8_t enAtomic = 0);
+    // Cross-card ("peer 直存") drivers: source stages A/B into the peer arena and
+    // computes local direct tiles; compute reads the arena and writes remote
+    // tiles straight into the source card's C over the link.
+    __aicore__ inline void ProcessCrossCardSource(uint8_t enAtomic);
+    __aicore__ inline void ProcessCrossCardCompute();
 
 private:
     __aicore__ inline uint64_t Min(uint64_t a, uint64_t b) const;
@@ -108,16 +114,18 @@ protected:
     GlobalTensor<uint32_t> dSignalGlobal_;
     TBuf<QuePosition::VECCALC> copyBuf_;
     TPipe* pipe_;
+    bool crossCard_ = false;  // arena provided => cooperative two-card execution
 };
 
 template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG,
           class MM_CB>
 __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG, MM_CB>::Init(
-    GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR biasGM, GM_ADDR workspaceGM, const void* tilingData, TPipe* pipe)
+    GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR biasGM, GM_ADDR workspaceGM, GM_ADDR arenaGM, GM_ADDR peerOutGM,
+    const void* tilingData, TPipe* pipe)
 {
     block_.template Init<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE>(tilingData);
     pipe_ = pipe;
-    InitInputs(aGM, bGM, cGM, biasGM, workspaceGM);
+    InitInputs(aGM, bGM, cGM, biasGM, workspaceGM, arenaGM, peerOutGM);
     const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
     const uint64_t coreIdx = GetCurrentBlockIdx();
     if ASCEND_IS_AIV {
@@ -135,24 +143,34 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
 template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG,
           class MM_CB>
 __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG, MM_CB>::InitInputs(
-    GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR biasGM, GM_ADDR workspaceGM)
+    GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR biasGM, GM_ADDR workspaceGM, GM_ADDR arenaGM, GM_ADDR peerOutGM)
 {
     using A_T = typename A_TYPE::T;
     using B_T = typename B_TYPE::T;
     using C_T = typename C_TYPE::T;
     using BiasT = typename BIAS_TYPE::T;
     const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
+    crossCard_ = (arenaGM != nullptr);
     aGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM),
                              static_cast<uint64_t>(block_.matmulFp32TilingData_->tCubeTiling.M) *
                                  block_.matmulFp32TilingData_->tCubeTiling.Ka);
     bGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(bGM),
                              static_cast<uint64_t>(block_.matmulFp32TilingData_->tCubeTiling.Kb) *
                                  block_.matmulFp32TilingData_->tCubeTiling.N);
-    cGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(cGM),
-                             static_cast<uint64_t>(block_.matmulFp32TilingData_->tCubeTiling.M) *
-                                 block_.matmulFp32TilingData_->tCubeTiling.N);
+    // Compute rank writes its remote tiles straight into the source card's C via
+    // peer_out; source (and single-card) writes into its own local C.
+    __gm__ C_T* outAddr = reinterpret_cast<__gm__ C_T*>(cGM);
+    if (crossCard_ && tilelet.role == 1 && peerOutGM != nullptr) {
+        outAddr = reinterpret_cast<__gm__ C_T*>(peerOutGM);
+    }
+    cGlobal_.SetGlobalBuffer(outAddr, static_cast<uint64_t>(block_.matmulFp32TilingData_->tCubeTiling.M) *
+                                          block_.matmulFp32TilingData_->tCubeTiling.N);
     biasGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(biasGM), block_.matmulFp32TilingData_->tCubeTiling.N);
-    __gm__ uint8_t* userWorkspace = reinterpret_cast<__gm__ uint8_t*>(workspaceGM);
+    // Signals and A/B/D staging live in the peer-visible arena when running
+    // cross-card, otherwise in this rank's own workspace. Offsets are identical
+    // either way, so both ranks agree byte-for-byte on the layout.
+    __gm__ uint8_t* userWorkspace =
+        crossCard_ ? reinterpret_cast<__gm__ uint8_t*>(arenaGM) : reinterpret_cast<__gm__ uint8_t*>(workspaceGM);
     const uint64_t abSignalCount = AbSignalCount();
     const uint64_t abSignalSlots = abSignalCount + 1 + abSignalCount * tilelet.commCoreNum;
     const uint64_t dSignalSlots = tilelet.compactTileSlots +
@@ -177,6 +195,15 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
     const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
     const uint64_t coreIdx = GetCurrentBlockIdx();
     if (coreIdx >= tilelet.totalCoreNum) {
+        return;
+    }
+    if (crossCard_) {
+        if (tilelet.role == 1) {
+            ProcessCrossCardCompute();
+        } else {
+            ProcessCrossCardSource(enAtomic);
+        }
+        PipeBarrier<PIPE_ALL>();
         return;
     }
     const bool remoteActive = tilelet.remoteTileEnd > tilelet.remoteTileStart;
@@ -639,6 +666,63 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
         WriteSignal(dSignalGlobal_, DCopyDoneIndex(wf, coreIdx), 1);
         WaitCopyBackWavefrontDone(wf);
     }
+}
+
+template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG,
+          class MM_CB>
+__aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG,
+                                                   MM_CB>::ProcessCrossCardSource(uint8_t enAtomic)
+{
+    // Source rank: AIV comm cores stage this problem's remote-tile A/B into the
+    // peer arena (and raise AB signals across the link); AIC cores compute the
+    // local direct tiles into the source card's own C. The arena is zeroed by
+    // the host before launch, so no in-kernel signal reset is needed.
+    const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
+    const uint64_t coreIdx = GetCurrentBlockIdx();
+    if ASCEND_IS_AIV {
+        if (tilelet.commCoreNum == 0 || tilelet.remoteTileEnd <= tilelet.remoteTileStart) {
+            return;
+        }
+        if (GetSubBlockIdx() != 0 || coreIdx >= tilelet.commCoreNum) {
+            return;
+        }
+        ProcessCommCopyIn(coreIdx);
+        return;
+    }
+    if ASCEND_IS_AIC {
+        ProcessComputeCoreDirect(coreIdx, enAtomic);
+        SetAtomicNone();
+    }
+}
+
+template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG,
+          class MM_CB>
+__aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG,
+                                                   MM_CB>::ProcessCrossCardCompute()
+{
+    // Compute rank: AIC cores wait for each remote wavefront's A/B to arrive in
+    // the arena (AB signals raised by the source), read the staged A/B locally,
+    // and write the remote tiles directly into the source card's C (cGlobal_ was
+    // retargeted to peer_out). Host-level stream sync of both ranks gates
+    // completion, so no D-done signalling is required here.
+    if ASCEND_IS_AIV {
+        return;
+    }
+    const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
+    const uint64_t computeIdx = GetCurrentBlockIdx();
+    for (uint64_t slot = computeIdx; slot < tilelet.compactTileSlots; slot += tilelet.computeCoreNum) {
+        uint64_t wfIndex = 0;
+        uint64_t localM = 0;
+        uint64_t localN = 0;
+        uint64_t mTile = 0;
+        uint64_t nTile = 0;
+        if (!DecodeCompactSlot(slot, wfIndex, localM, localN, mTile, nTile) || !IsRemoteSlot(slot)) {
+            continue;
+        }
+        WaitAbSignalForWavefront(wfIndex);
+        ComputeRemoteTileDirectD(wfIndex, localM, localN, mTile, nTile);
+    }
+    SetAtomicNone();
 }
 
 template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG,

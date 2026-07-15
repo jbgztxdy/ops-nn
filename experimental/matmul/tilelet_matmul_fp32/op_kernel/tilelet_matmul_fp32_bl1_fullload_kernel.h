@@ -26,8 +26,10 @@ class TileletMatmulFp32BL1FullLoadKernel {
 public:
     __aicore__ inline TileletMatmulFp32BL1FullLoadKernel(){};
 
+    // arenaGM/peerOutGM are accepted for signature parity with the base kernel
+    // (cross-card path); the BL1 full-load path is single-card and ignores them.
     __aicore__ inline void Init(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR biasGM, GM_ADDR workspaceGM,
-                                const void* tilingData, TPipe* pipe);
+                                GM_ADDR arenaGM, GM_ADDR peerOutGM, const void* tilingData, TPipe* pipe);
     __aicore__ inline void Process(uint64_t index = 0, uint8_t enAtomic = 0);
 
 protected:
@@ -51,8 +53,11 @@ private:
 
 template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG>
 __aicore__ inline void TileletMatmulFp32BL1FullLoadKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG>::Init(
-    GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR biasGM, GM_ADDR workspaceGM, const void* tilingData, TPipe* pipe)
+    GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR biasGM, GM_ADDR workspaceGM, GM_ADDR arenaGM, GM_ADDR peerOutGM,
+    const void* tilingData, TPipe* pipe)
 {
+    (void)arenaGM;
+    (void)peerOutGM;
     block_.template Init<A_TYPE, B_TYPE_NEW, C_TYPE, BIAS_TYPE>(tilingData);
     pipe_ = pipe;
     aGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM),

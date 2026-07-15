@@ -22,6 +22,12 @@ function get_thread_num_with_json_config() {
   local _thread_num=1
   local _binary_config_full_path=$1
   local _core_num=$(cat /proc/cpuinfo | grep "processor" | wc -l)
+  # tilelet_matmul_fp32: force a single compile shard. This op's bin-compile
+  # worker count is 1, and splitting into >1 shard leaves shards uncompiled
+  # (drops the bf16 variant). Single shard = single worker compiles all bins.
+  if echo "${_binary_config_full_path}" | grep -q "tilelet_matmul_fp32"; then
+     return 1
+  fi
   _thread_num=$(cat ${_binary_config_full_path} | grep bin_filename | wc -l)
   if [ "${_thread_num}" == "" ]; then
      return 1

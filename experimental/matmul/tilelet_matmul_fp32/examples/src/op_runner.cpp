@@ -332,10 +332,12 @@ bool OpRunner::RunOp()
     bool enableDCopyback = GetEnvInt64("TILELET_ENABLE_D_COPYBACK", GetEnvInt64("TILELET_D_COPYBACK", 0)) != 0;
     const aclTensor* biasTensor = numInputs_ > 2 ? inputTensor_[2] : nullptr;
     aclOpExecutor* handle = nullptr;
-    auto ret = aclnnTileletMatmulFp32GetWorkspaceSize(inputTensor_[0], inputTensor_[1], biasTensor, transposeX1,
+    // Single-card path: no cross-card arena/peer_out, role=0 (source), world=1.
+    auto ret = aclnnTileletMatmulFp32GetWorkspaceSize(inputTensor_[0], inputTensor_[1], biasTensor,
+                                               /*arena=*/nullptr, /*peer_out=*/nullptr, transposeX1,
                                                transposeX2, remoteTileStart, remoteTileCount, wavefrontM, wavefrontN,
-                                               commCoreNum, commKTiles, enableDCopyback, outputTensor_[0],
-                                               &workspaceSize, &handle);
+                                               commCoreNum, commKTiles, enableDCopyback, /*role=*/0, /*rank_id=*/0,
+                                               /*world_size=*/1, outputTensor_[0], &workspaceSize, &handle);
     if (ret != ACL_SUCCESS) {
         (void)aclrtDestroyStream(stream);
         ERROR_LOG("Get Operator Workspace failed. error code is %d", static_cast<int32_t>(ret));
