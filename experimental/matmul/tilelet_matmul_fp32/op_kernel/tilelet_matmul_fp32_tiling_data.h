@@ -34,6 +34,9 @@ struct TileletMatmulFp32TileletInfo {
     uint32_t wavefrontRows;
     uint32_t wavefrontCols;
     uint32_t wavefrontCount;
+    uint32_t commKTiles;
+    uint32_t kGroupCount;
+    uint32_t enableDCopyback;
     uint32_t compactTileSlots;
     uint32_t remoteTileStart;
     uint32_t remoteTileEnd;
