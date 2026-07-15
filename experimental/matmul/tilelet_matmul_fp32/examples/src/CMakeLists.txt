@@ -20,8 +20,11 @@ add_compile_options(-std=c++11)
 get_filename_component(OPS_NN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)
 set(OPS_NN_BUILD_DIR "${OPS_NN_ROOT}/build")
 set(OPS_NN_AUTOGEN_DIR "${OPS_NN_BUILD_DIR}/autogen")
-set(OPS_NN_STATIC_LIB "${OPS_NN_BUILD_DIR}/bin_tmp/ascend910b/libcann_nn_static.a")
-set(OPS_NN_RESOURCE_CPP "${OPS_NN_AUTOGEN_DIR}/ascend910b/aclnnop_resource/TileletMatmulFp32_op_resource.cpp")
+# SoC short name of the ops-nn build to link against. 910B: ascend910b, 910C: ascend910_93.
+# Override with -DTILELET_SOC=ascend910b when building against a 910B tree.
+set(TILELET_SOC "ascend910_93" CACHE STRING "ops-nn build soc short name")
+set(OPS_NN_STATIC_LIB "${OPS_NN_BUILD_DIR}/bin_tmp/${TILELET_SOC}/libcann_nn_static.a")
+set(OPS_NN_RESOURCE_CPP "${OPS_NN_AUTOGEN_DIR}/${TILELET_SOC}/aclnnop_resource/TileletMatmulFp32_op_resource.cpp")
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "../output")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "../output")

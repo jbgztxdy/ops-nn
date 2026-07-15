@@ -222,33 +222,67 @@ env TILELET_DTYPE=bf16 python3 scripts/verify_result.py output/output_z.bin outp
 
 ---
 
+# 第三阶段：910C 落地（本轮，2026-07）
+
+机器换到 **910C**（SoC `Ascend910_9362`，工具链短名 `ascend910_93` / 长名 `Ascend910_9391`，CANN 8.5.2；
+每 die 20 个 AIC core；16 die，P2P 全通）。本轮完成：
+
+- **910C 构建跑通**。文档原来的纯 cmake 流程在干净树上不成立（experimental 算子要 `build.sh` 先做
+  PREPROCESS 配置生成依赖表）。正确配方：
+  `bash build.sh --static --experimental --soc=ascend910_93 --ops=tilelet_matmul_fp32 --vendor_name=custom -j8`
+  （产出 fp32+bf16 两套 kernel bin + `build/bin_tmp/ascend910_93/libcann_nn_static.a` + resource cpp）。
+- **examples 两处 910C 适配**（已改）：`examples/src/CMakeLists.txt` 的 `ascend910b` 路径改为
+  `-DTILELET_SOC`（默认 `ascend910_93`）；配置 examples 时必须加 `-DCMAKE_SKIP_BUILD_RPATH=ON`，否则 RPATH
+  烧进 `aarch64-linux/devlib` 的 **stub `libascend_hal.so`**，运行期 `aclInit` 报 `init soc version failed`。
+  运行环境用 `set_env.sh` + `LD_LIBRARY_PATH=<ops-nn>/build:...`，**不要**再前置 `aarch64-linux/lib64`。
+- **单卡 + 两卡 gate 在 910C 全过**（BF16 / transpose_x2 / direct-D，`error ratio 0.0000, test pass`）：
+  默认 256×512×64、多 wavefront 2176×2304×8（remote=[0,384)）、多 K-group 256×512×128（`comm_k_tiles=1`）。
+- **任务2 部分完成**：`gen_data.py` 的 golden 改写为 numpy（与旧纯 Python golden **逐字节一致**，快 ~24×）；
+  `main_crosscard.cpp` 的 arena 改为按 **算子精确 `arenaBytes`** 分配（新增头
+  `examples/inc/tilelet_host_layout.h`，与 `InitTileletInfo` 逐字节对齐，已用算子 `userWs` 日志校验：
+  256×512×64 kt32→8922624、kt1→8923136）。两卡 gate 用动态 arena（9.5MB / 33MB）复跑通过。
+- **任务4 完成**：`tilelet_host_layout.h` 内实现 `MapRatioToRemoteTiles`（镜像 CUDA `ScheduleRemoteLinear`
+  + `ClampRemoteCtasByRatio`：按两卡 AIC 数平衡 remote/local wavefront → CTA → `[ceil(total·min),
+  floor(total·max)]` 截断，remote 取 compact-slot 前缀 start=0）。`main_crosscard.cpp` 加
+  `TILELET_MIN/MAX_REMOTE_CTA_RATIO`(+`TILELET_SOURCE_SM/COMPUTE_SM`)：设了就用 ratio 推导 remote 范围。
+  实测 `ratio[0.0,0.4]` src=cmp=20 → 2176×2304×8 得 `remote=[0,204)`（4 wavefront 平衡取 2，40% 截断），`test pass`。
+- **任务3「in-kernel 跨卡 D-done」完成**：新增可选输入 `peer_dsignal`（**放在 source 卡**、对 compute 卡
+  peer 可见）。compute rank 每写完一块 remote C（peer 写 source）后 `PipeBarrier<PIPE_ALL>` + 写 D-done 到
+  `peer_dsignal`（同为 source 卡，故与 C 写有序）；source rank 的 AIC core0 在 kernel 内轮询全部 remote slot
+  的 D-done 再返回，于是 **source stream 完成即代表 C 组装完毕，不再依赖 host 同步做正确性**。缺省不传
+  `peer_dsignal` 时回落到原 host 同步行为（回归安全，单卡/旧两卡路径 `test pass` 不变）。aclnn 签名新增
+  `peer_dsignal`（在 `peer_out` 与 `transposeX1` 之间）；kernel 入口、`Init/InitInputs`、bl1 kernel、
+  `op_runner.cpp` 均已对齐。
+
+**910C 仍缺（本轮受限）**：`msprof` 性能/overlap（任务1）与 vLLM 级大 shape 实测（任务2 尾巴）——本机 16 die
+被生产 `vllm serve GLM-5.1` 占满 HBM（每 die ~62/64GB），只够跑小 shape 正确性 gate；且共享机上 profiling
+噪声大、会挤生产任务。需空闲卡后再做。（vLLM 16384×28672×28672 经 `tilelet_host_layout.h` 估算 arena≈3.3GB。）
+
+---
+
 # 尚未完成 / 需要在 910C 上继续
 
-按优先级：
+按优先级（勾选为本轮已处理）：
 
-1. **性能 / overlap 验证（最关键，910B 没做）**。目前只在低带宽 910B 验了**正确性**。tilelet 的价值是
-   通信与计算 overlap 带来的提速，必须在 910C 真机 profiling：AIC timeline、HCCS 吞吐、comm core 与
-   compute core 是否时间重叠、端到端 duration。
+1. **[仍缺-受限] 性能 / overlap 验证（最关键，910B 没做）**。目前只在低带宽 910B 验了**正确性**。tilelet 的
+   价值是通信与计算 overlap 带来的提速，必须在 910C 真机 profiling：AIC timeline、HCCS 吞吐、comm core 与
+   compute core 是否时间重叠、端到端 duration。**本轮受限于共享机 HBM 占满未做，需空闲卡。**
 
-2. **大 shape 跨卡实测**。已验证默认 256×512×64、强制多 wavefront 的 2176×2304×8、以及多 K-group 的
-   256×512×128（`comm_k_tiles=1`）。vLLM 真实 shape 仍大得多（`scratch_max_m=16384`、`n=28672`、
-   `k=28672`）。阻碍：`examples/scripts/gen_data.py` 的 golden 仍是纯 Python 三重循环，大 shape 极慢。
-   后续应先写一个快速 golden（numpy / 设备端参考），再放大 M/N/K，同时把 `main_crosscard.cpp` 里固定
-   512MB 的 arena 改为按算子报出的 `arenaBytes` 分配。
+2. **[部分完成] 大 shape 跨卡实测**。✅ 已写快速 numpy golden、✅ arena 改为按 `arenaBytes` 动态分配。
+   ❌ vLLM 级大 shape（`scratch_max_m=16384`、`n=28672`、`k=28672`，arena≈3.3GB）实测仍缺——受限于共享机
+   HBM 占满（每 die 仅 ~3GB 空闲），需空闲卡。
 
-3. **补齐 v1 相对 CUDA 的简化**（当前对 benchmark 路径功能等价，但不同构）：
-   - **in-kernel 跨卡 D-done 轮询**：现在靠 host 同步两 stream；CUDA 是 compute rank 发 D-done、source 在
-     kernel 内等（`ComputeRemoteTileDirectD` 完成后 compute 无 D-done 写；`ProcessCommCopyBack`/
-     `WaitCopyBackWavefrontDone` 是单卡 copyback 路径的遗留）。真接入若 source 不能靠 host 同步就往下走，
-     需要把 D-done 做成跨卡可见并在 source kernel 内等待。
-   - **copyback 路径（d_copyback=true）跨卡未验证**：只做了 direct-D。若 benchmark 之外要支持 copyback，
+3. **补齐 v1 相对 CUDA 的简化**：
+   - ✅ **in-kernel 跨卡 D-done 轮询（本轮完成）**：见上「第三阶段」。经可选输入 `peer_dsignal`（source 卡、
+     compute peer 可见）实现，source kernel 内轮询、不再依赖 host 同步做正确性；缺省不传则回落旧行为。
+   - ❌ **copyback 路径（d_copyback=true）跨卡未验证**：只做了 direct-D。若 benchmark 之外要支持 copyback，
      `CopyBackRemoteTile / CopyBackRemoteWavefront / dStage` 需要在跨卡布局下重新走通。
-   - **arena 分配器**：目前测试驱动直接 `aclrtMalloc` 一块 peer 可见 buffer；真接入要一个 peer 可见分配器
-     （对应 CUDA 的 same-VA allocator），并处理生命周期与多算子复用。
+   - ❌ **arena 分配器**：目前测试驱动直接 `aclrtMalloc` 一块 peer 可见 buffer（大小已按 `arenaBytes` 精确）；
+     真接入要一个 peer 可见分配器（对应 CUDA same-VA allocator），处理生命周期与多算子复用——归入框架层。
 
-4. **ratio 调度映射**。CUDA 用 `min/max_remote_cta_ratio`（见 `torch_bindings.cpp` 的
-   `ClampRemoteCtasByRatio`）动态决定 remote CTA 数；Ascend 侧用显式 `remote_tile_start/count`。接入时要在
-   框架层把 ratio 调度结果映射为这两个 attr。
+4. **[已完成] ratio 调度映射**。见上「第三阶段」：`tilelet_host_layout.h::MapRatioToRemoteTiles` 镜像
+   `ClampRemoteCtasByRatio`/`ScheduleRemoteLinear`，`main_crosscard.cpp` 已接受 `TILELET_MIN/MAX_REMOTE_CTA_RATIO`
+   并实测通过。框架接入时复用同一头。
 
 5. **框架接入层（非平凡）**。要跑进 Ascend vLLM，需要：peer 可见 arena 分配器 + 两 rank launch 编排
    （对应 `tilelet_multiprocess_gemm.cu`）+ ratio→tile 映射 + peer access 使能 + 接到 `vllm/vllm/tilelet.py`

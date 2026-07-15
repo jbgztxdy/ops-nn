@@ -64,6 +64,21 @@ public:
             .FormatForBinQuery({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
             .AutoContiguous();
+        // Cross-card D-done signal buffer that lives on the SOURCE card and is
+        // peer-visible to the compute rank. The compute rank raises a per-remote-
+        // tile D-done flag here (a peer write to the same card as C, hence ordered
+        // after the C write), and the source rank waits on it in-kernel. When
+        // absent the op falls back to host stream-sync for completion (v1). The
+        // kernel reinterprets this buffer as uint32 signal words; its declared
+        // dtype only needs to match the two-config (fp32/bf16) binary query.
+        this->Input("peer_dsignal")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .DataTypeForBinQuery({ge::DT_FLOAT, ge::DT_BF16})
+            .FormatForBinQuery({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .AutoContiguous();
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT, ge::DT_BF16})
