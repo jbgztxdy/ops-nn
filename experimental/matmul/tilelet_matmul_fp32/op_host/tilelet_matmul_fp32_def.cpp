@@ -19,17 +19,47 @@ class TileletMatmulFp32 : public OpDef {
 public:
     explicit TileletMatmulFp32(const char* name) : OpDef(name)
     {
-        this->Input("x1").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
-        this->Input("x2").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
-        this->Input("bias").ParamType(OPTIONAL).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
-        this->Output("y").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
+        this->Input("x1")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .DataTypeForBinQuery({ge::DT_FLOAT, ge::DT_BF16})
+            .FormatForBinQuery({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("x2")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .DataTypeForBinQuery({ge::DT_FLOAT, ge::DT_BF16})
+            .FormatForBinQuery({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("bias")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .DataTypeForBinQuery({ge::DT_FLOAT, ge::DT_BF16})
+            .FormatForBinQuery({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .DataTypeForBinQuery({ge::DT_FLOAT, ge::DT_BF16})
+            .FormatForBinQuery({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .AutoContiguous();
         this->Attr("transpose_x1").AttrType(OPTIONAL).Bool(false);
         this->Attr("transpose_x2").AttrType(OPTIONAL).Bool(false);
         this->Attr("remote_tile_start").AttrType(OPTIONAL).Int(0);
         this->Attr("remote_tile_count").AttrType(OPTIONAL).Int(0);
-        this->Attr("wavefront_m").AttrType(OPTIONAL).Int(8);
-        this->Attr("wavefront_n").AttrType(OPTIONAL).Int(4);
-        this->Attr("comm_core_num").AttrType(OPTIONAL).Int(2);
+        this->Attr("wavefront_m").AttrType(OPTIONAL).Int(16);
+        this->Attr("wavefront_n").AttrType(OPTIONAL).Int(8);
+        this->Attr("comm_core_num").AttrType(OPTIONAL).Int(8);
+        this->Attr("comm_k_tiles").AttrType(OPTIONAL).Int(32);
+        this->Attr("enable_d_copyback").AttrType(OPTIONAL).Bool(false);
         this->AICore().AddConfig("ascend910b");
         this->AICore().AddConfig("ascend910_93");
     }

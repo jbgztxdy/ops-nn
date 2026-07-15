@@ -18,6 +18,7 @@
 #include "tiling/tiling_api.h"
 #include "op_host/tiling_util.h"
 #include "op_host/tiling_templates_registry.h"
+#include "register/tilingdata_base.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "../op_kernel/tilelet_matmul_fp32_tiling_data.h"
 #include "../op_kernel/tilelet_matmul_fp32_tiling_key.h"
@@ -27,6 +28,12 @@
 using namespace matmul_tiling;
 
 namespace optiling {
+BEGIN_TILING_DATA_DEF(TileletMatmulFp32RawTilingData)
+TILING_DATA_FIELD_DEF_ARR(uint8_t, sizeof(TileletMatmulFp32TilingData), raw);
+END_TILING_DATA_DEF
+
+REGISTER_TILING_DATA_CLASS(TileletMatmulFp32, TileletMatmulFp32RawTilingData)
+
 constexpr uint64_t WS_SYS_SIZE = 16U * 1024U * 1024U; // 16MB
 constexpr uint64_t DB_SIZE = 2UL;
 constexpr uint64_t BLOCK_BYTE_SIZE = 32UL;
@@ -47,6 +54,10 @@ constexpr uint64_t BASIC_ALIGN_256 = 256UL;
 constexpr uint64_t BASIC_ALIGN_512 = 512UL;
 constexpr uint64_t SIGNAL_SLOT_BYTES = 64UL;
 constexpr uint64_t MIN_BASE_M_VALUE = 16;
+constexpr uint64_t TILELET_DEFAULT_WAVEFRONT_M = 16UL;
+constexpr uint64_t TILELET_DEFAULT_WAVEFRONT_N = 8UL;
+constexpr uint64_t TILELET_DEFAULT_COMM_CORES = 8UL;
+constexpr uint64_t TILELET_DEFAULT_COMM_K_TILES = 32UL;
 
 uint64_t FULL_LOAD_TYPE = TILELET_MATMUL_FP32_NO_FULLLOAD;
 bool is_support_bl1 = false;
@@ -89,9 +100,11 @@ struct TileletMatmulFp32Args {
     bool hasBias = false;
     int64_t remoteTileStart = 0;
     int64_t remoteTileCount = 0;
-    int64_t wavefrontM = 8;
-    int64_t wavefrontN = 4;
-    int64_t commCoreNum = 2;
+    int64_t wavefrontM = TILELET_DEFAULT_WAVEFRONT_M;
+    int64_t wavefrontN = TILELET_DEFAULT_WAVEFRONT_N;
+    int64_t commCoreNum = TILELET_DEFAULT_COMM_CORES;
+    int64_t commKTiles = TILELET_DEFAULT_COMM_K_TILES;
+    bool enableDCopyback = false;
     ge::DataType aType = ge::DT_FLOAT;
     ge::DataType bType = ge::DT_FLOAT;
     ge::DataType cType = ge::DT_FLOAT;
@@ -116,6 +129,26 @@ inline uint64_t CeilAlign(uint64_t x, uint64_t align) { return CeilDiv(x, align)
 
 inline uint64_t AlignBytes(uint64_t x, uint64_t align) { return CeilAlign(x, align); }
 
+inline uint64_t ElementSize(ge::DataType dtype)
+{
+    return dtype == ge::DT_BF16 ? 2UL : DATA_SIZE_FP32;
+}
+
+inline matmul_tiling::DataType ToMatmulDataType(ge::DataType dtype)
+{
+    return dtype == ge::DT_BF16 ? matmul_tiling::DataType::DT_BF16 : matmul_tiling::DataType::DT_FLOAT;
+}
+
+inline uint32_t ToTplDataType(ge::DataType dtype)
+{
+    return dtype == ge::DT_BF16 ? static_cast<uint32_t>(C_DT_BF16) : static_cast<uint32_t>(C_DT_FLOAT);
+}
+
+inline bool IsSupportedDataType(ge::DataType dtype)
+{
+    return dtype == ge::DT_FLOAT || dtype == ge::DT_BF16;
+}
+
 static void InitTileletInfo(TileletMatmulFp32CompileInfo* compileInfoPtr, TileletMatmulFp32Args* argsPtr,
                             TileletMatmulFp32TilingData* tilingDataPtr)
 {
@@ -125,12 +158,19 @@ static void InitTileletInfo(TileletMatmulFp32CompileInfo* compileInfoPtr, Tilele
     const uint64_t tileN = tiling.singleCoreN;
     const uint64_t mTileCnt = CeilDiv(argsPtr->mValue, tileM);
     const uint64_t nTileCnt = CeilDiv(argsPtr->nValue, tileN);
-    const uint64_t wavefrontM = argsPtr->wavefrontM <= 0 ? 8UL : static_cast<uint64_t>(argsPtr->wavefrontM);
-    const uint64_t wavefrontN = argsPtr->wavefrontN <= 0 ? 4UL : static_cast<uint64_t>(argsPtr->wavefrontN);
+    const uint64_t wavefrontM =
+        argsPtr->wavefrontM <= 0 ? TILELET_DEFAULT_WAVEFRONT_M : static_cast<uint64_t>(argsPtr->wavefrontM);
+    const uint64_t wavefrontN =
+        argsPtr->wavefrontN <= 0 ? TILELET_DEFAULT_WAVEFRONT_N : static_cast<uint64_t>(argsPtr->wavefrontN);
     const uint64_t wavefrontRows = CeilDiv(mTileCnt, wavefrontM);
     const uint64_t wavefrontCols = CeilDiv(nTileCnt, wavefrontN);
     const uint64_t wavefrontCount = wavefrontRows * wavefrontCols;
     const uint64_t abSignalCount = wavefrontRows + wavefrontCols - 1;
+    const uint64_t commKTiles =
+        argsPtr->commKTiles <= 0 ? TILELET_DEFAULT_COMM_K_TILES : static_cast<uint64_t>(argsPtr->commKTiles);
+    const uint64_t kTileCount = CeilDiv(argsPtr->kValue, std::max<uint64_t>(1, tiling.baseK));
+    const uint64_t kGroupCount = std::max<uint64_t>(1, CeilDiv(kTileCount, commKTiles));
+    const uint64_t abSignalGroupCount = abSignalCount * kGroupCount;
     const uint64_t compactTileSlots = wavefrontCount * wavefrontM * wavefrontN;
 
     uint64_t remoteTileStart = argsPtr->remoteTileStart <= 0 ? 0UL : static_cast<uint64_t>(argsPtr->remoteTileStart);
@@ -148,7 +188,7 @@ static void InitTileletInfo(TileletMatmulFp32CompileInfo* compileInfoPtr, Tilele
     uint64_t commCoreNum = 0;
     if (remoteTileEnd > remoteTileStart && !serialTilelet && computeCoreNum > 0) {
         const uint64_t requestedComm =
-            argsPtr->commCoreNum <= 0 ? 2UL : static_cast<uint64_t>(argsPtr->commCoreNum);
+            argsPtr->commCoreNum <= 0 ? TILELET_DEFAULT_COMM_CORES : static_cast<uint64_t>(argsPtr->commCoreNum);
         commCoreNum = std::min(requestedComm, computeCoreNum);
     }
     if (!serialTilelet && commCoreNum == 0) {
@@ -168,33 +208,42 @@ static void InitTileletInfo(TileletMatmulFp32CompileInfo* compileInfoPtr, Tilele
     info.wavefrontRows = static_cast<uint32_t>(wavefrontRows);
     info.wavefrontCols = static_cast<uint32_t>(wavefrontCols);
     info.wavefrontCount = static_cast<uint32_t>(wavefrontCount);
+    info.commKTiles = static_cast<uint32_t>(commKTiles);
+    info.kGroupCount = static_cast<uint32_t>(kGroupCount);
+    info.enableDCopyback = argsPtr->enableDCopyback ? 1U : 0U;
     info.compactTileSlots = static_cast<uint32_t>(compactTileSlots);
     info.remoteTileStart = static_cast<uint32_t>(remoteTileStart);
     info.remoteTileEnd = static_cast<uint32_t>(remoteTileEnd);
     info.aSlabElements = wavefrontM * tileM * argsPtr->kValue;
-    info.bSlabElements = argsPtr->kValue * wavefrontNStride;
+    if (argsPtr->isBTrans) {
+        info.bSlabElements = wavefrontNStride * argsPtr->kValue;
+    } else {
+        const uint64_t bStageStride = argsPtr->enableDCopyback ? wavefrontNStride : argsPtr->nValue;
+        info.bSlabElements = argsPtr->kValue * bStageStride;
+    }
     info.dSlabElements = wavefrontM * tileM * wavefrontNStride;
 
     info.abSignalByteOffset = 0;
-    const uint64_t abSignalSlots = abSignalCount + 1 + abSignalCount * commCoreNum;
+    const uint64_t abSignalSlots = abSignalGroupCount + 1 + abSignalGroupCount * commCoreNum;
     const uint64_t dSignalSlots = compactTileSlots + wavefrontCount * commCoreNum;
+    const uint64_t elemSize = ElementSize(argsPtr->aType);
     info.dSignalByteOffset = AlignBytes(abSignalSlots * SIGNAL_SLOT_BYTES, 64);
     info.aSlabByteOffset = AlignBytes(info.dSignalByteOffset + dSignalSlots * SIGNAL_SLOT_BYTES, 64);
     info.bSlabByteOffset =
-        AlignBytes(info.aSlabByteOffset + wavefrontRows * info.aSlabElements * DATA_SIZE_FP32, 64);
+        AlignBytes(info.aSlabByteOffset + wavefrontRows * info.aSlabElements * elemSize, 64);
     info.dSlabByteOffset =
-        AlignBytes(info.bSlabByteOffset + wavefrontCols * info.bSlabElements * DATA_SIZE_FP32, 64);
+        AlignBytes(info.bSlabByteOffset + wavefrontCols * info.bSlabElements * elemSize, 64);
     info.userWorkspaceBytes =
         remoteTileEnd <= remoteTileStart
             ? 0
-            : AlignBytes(info.dSlabByteOffset + wavefrontCount * info.dSlabElements * DATA_SIZE_FP32,
-                         BASIC_ALIGN_512);
+            : AlignBytes(info.dSlabByteOffset + wavefrontCount * info.dSlabElements * elemSize, BASIC_ALIGN_512);
 
     OP_LOGI(argsPtr->opName,
-            "tilelet info tileM:%lu tileN:%lu wf:%lux%lu wfCnt:%lu slots:%lu remote:[%lu,%lu) comm:%lu compute:%lu "
-            "userWs:%lu",
+            "tilelet info tileM:%lu tileN:%lu wf:%lux%lu wfCnt:%lu slots:%lu remote:[%lu,%lu) comm:%lu "
+            "commKTiles:%lu kGroups:%lu dCopyback:%d compute:%lu userWs:%lu",
             tileM, tileN, wavefrontM, wavefrontN, wavefrontCount, compactTileSlots, remoteTileStart, remoteTileEnd,
-            commCoreNum, computeCoreNum, info.userWorkspaceBytes);
+            commCoreNum, commKTiles, kGroupCount, static_cast<int32_t>(info.enableDCopyback), computeCoreNum,
+            info.userWorkspaceBytes);
 }
 
 static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, TileletMatmulFp32CompileInfo* compileInfoPtr)
@@ -233,6 +282,7 @@ static ge::graphStatus GetShapeAttrsInfo(gert::TilingContext* context, TileletMa
     auto shapeBias = context->GetInputShape(2);
     auto descX1 = context->GetInputDesc(0);
     auto descX2 = context->GetInputDesc(1);
+    auto descBias = context->GetInputDesc(2);
     auto descOut = context->GetOutputDesc(0);
     auto attrs = context->GetAttrs();
     OP_CHECK_IF(shapeX1 == nullptr || shapeX2 == nullptr || descX1 == nullptr || descX2 == nullptr ||
@@ -241,19 +291,23 @@ static ge::graphStatus GetShapeAttrsInfo(gert::TilingContext* context, TileletMa
     // 输入属性信息
     argsPtr->isATrans = *attrs->GetAttrPointer<bool>(0);
     argsPtr->isBTrans = *attrs->GetAttrPointer<bool>(1);
-    OP_CHECK_IF(argsPtr->isATrans || argsPtr->isBTrans,
-                OP_LOGE(argsPtr->opName, "tilelet_matmul_fp32 currently supports non-transposed row-major inputs only"),
+    OP_CHECK_IF(argsPtr->isATrans,
+                OP_LOGE(argsPtr->opName, "tilelet_matmul_fp32 currently supports non-transposed x1 only"),
                 return ge::GRAPH_FAILED);
     const int64_t* remoteTileStart = attrs->GetAttrPointer<int64_t>(2);
     const int64_t* remoteTileCount = attrs->GetAttrPointer<int64_t>(3);
     const int64_t* wavefrontM = attrs->GetAttrPointer<int64_t>(4);
     const int64_t* wavefrontN = attrs->GetAttrPointer<int64_t>(5);
     const int64_t* commCoreNum = attrs->GetAttrPointer<int64_t>(6);
+    const int64_t* commKTiles = attrs->GetAttrPointer<int64_t>(7);
+    const bool* enableDCopyback = attrs->GetAttrPointer<bool>(8);
     argsPtr->remoteTileStart = remoteTileStart == nullptr ? 0 : *remoteTileStart;
     argsPtr->remoteTileCount = remoteTileCount == nullptr ? 0 : *remoteTileCount;
-    argsPtr->wavefrontM = wavefrontM == nullptr ? 8 : *wavefrontM;
-    argsPtr->wavefrontN = wavefrontN == nullptr ? 4 : *wavefrontN;
-    argsPtr->commCoreNum = commCoreNum == nullptr ? 2 : *commCoreNum;
+    argsPtr->wavefrontM = wavefrontM == nullptr ? TILELET_DEFAULT_WAVEFRONT_M : *wavefrontM;
+    argsPtr->wavefrontN = wavefrontN == nullptr ? TILELET_DEFAULT_WAVEFRONT_N : *wavefrontN;
+    argsPtr->commCoreNum = commCoreNum == nullptr ? TILELET_DEFAULT_COMM_CORES : *commCoreNum;
+    argsPtr->commKTiles = commKTiles == nullptr ? TILELET_DEFAULT_COMM_K_TILES : *commKTiles;
+    argsPtr->enableDCopyback = enableDCopyback == nullptr ? false : *enableDCopyback;
 
     // 输入、输出格式信息
     argsPtr->aFormat = static_cast<ge::Format>(ge::GetPrimaryFormat(descX1->GetStorageFormat()));
@@ -266,8 +320,12 @@ static ge::graphStatus GetShapeAttrsInfo(gert::TilingContext* context, TileletMa
     argsPtr->aType = descX1->GetDataType();
     argsPtr->bType = descX2->GetDataType();
     argsPtr->cType = descOut->GetDataType();
-    OP_CHECK_IF(argsPtr->aType != ge::DT_FLOAT || argsPtr->bType != ge::DT_FLOAT || argsPtr->cType != ge::DT_FLOAT,
-                OP_LOGE(argsPtr->opName, "input and output only support float32"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(!IsSupportedDataType(argsPtr->aType) || !IsSupportedDataType(argsPtr->bType) ||
+                    !IsSupportedDataType(argsPtr->cType),
+                OP_LOGE(argsPtr->opName, "input and output only support float32 and bf16"),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(argsPtr->aType != argsPtr->bType || argsPtr->aType != argsPtr->cType,
+                OP_LOGE(argsPtr->opName, "x1, x2 and y must use the same dtype"), return ge::GRAPH_FAILED);
 
     // 获取input的m/n/k
     const size_t x1DimNum = shapeX1->GetStorageShape().GetDimNum();
@@ -275,9 +333,20 @@ static ge::graphStatus GetShapeAttrsInfo(gert::TilingContext* context, TileletMa
     OP_CHECK_IF(x1DimNum != 2 || x2DimNum != 2,
                 OP_LOGE(argsPtr->opName, "the input shape dimensions are not equal to 2"), return ge::GRAPH_FAILED);
     argsPtr->hasBias = shapeBias == nullptr ? false : true;
+    if (argsPtr->hasBias) {
+        OP_CHECK_IF(descBias == nullptr, OP_LOGE(argsPtr->opName, "bias desc is null"), return ge::GRAPH_FAILED);
+        argsPtr->biasType = descBias->GetDataType();
+        OP_CHECK_IF(argsPtr->biasType != argsPtr->aType,
+                    OP_LOGE(argsPtr->opName, "bias dtype must match input dtype"), return ge::GRAPH_FAILED);
+    }
     argsPtr->mValue = argsPtr->isATrans ? shapeX1->GetStorageShape().GetDim(1) : shapeX1->GetStorageShape().GetDim(0);
     argsPtr->kValue = argsPtr->isATrans ? shapeX1->GetStorageShape().GetDim(0) : shapeX1->GetStorageShape().GetDim(1);
     argsPtr->nValue = argsPtr->isBTrans ? shapeX2->GetStorageShape().GetDim(0) : shapeX2->GetStorageShape().GetDim(1);
+    const uint64_t bKValue = static_cast<uint64_t>(argsPtr->isBTrans ? shapeX2->GetStorageShape().GetDim(1) :
+                                                                       shapeX2->GetStorageShape().GetDim(0));
+    OP_CHECK_IF(argsPtr->kValue != bKValue,
+                OP_LOGE(argsPtr->opName, "x1 K and x2 K are not equal, x1K:%lu x2K:%lu", argsPtr->kValue, bKValue),
+                return ge::GRAPH_FAILED);
     OP_LOGD(context->GetNodeName(), "parse op shape info m:%d, n:%d, k:%d", static_cast<int>(argsPtr->mValue),
             static_cast<int>(argsPtr->nValue), static_cast<int>(argsPtr->kValue));
     return ge::GRAPH_SUCCESS;
@@ -288,18 +357,16 @@ static ge::graphStatus InitTilingData(AscendC::tiling::TCubeTiling& tCubeTiling,
 {
     auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
     MultiCoreMatmulTiling tilingApi(*ascendcPlatform);
-    tilingApi.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT,
-                       argsPtr->isATrans);
-    tilingApi.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT,
-                       argsPtr->isBTrans);
-    tilingApi.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    const auto matmulDType = ToMatmulDataType(argsPtr->aType);
+    tilingApi.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmulDType, argsPtr->isATrans);
+    tilingApi.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmulDType, argsPtr->isBTrans);
+    tilingApi.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmulDType);
     tilingApi.SetDim(compileInfoPtr->aicNum);
     tilingApi.SetShape(argsPtr->mValue, argsPtr->nValue, argsPtr->kValue);
     tilingApi.SetOrgShape(argsPtr->mValue, argsPtr->nValue, argsPtr->kValue);
     if (argsPtr->hasBias) {
         tilingApi.SetBias(true);
-        tilingApi.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
-                              matmul_tiling::DataType::DT_FLOAT);
+        tilingApi.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmulDType);
     }
     tilingApi.SetBufferSpace(compileInfoPtr->l1Size, compileInfoPtr->l0CSize, compileInfoPtr->ubSize);
     if (tilingApi.GetTiling(tCubeTiling) == -1) {
@@ -448,19 +515,26 @@ static ge::graphStatus PostTiling(gert::TilingContext* context, TileletMatmulFp3
     InitTileletInfo(compileInfoPtr, argsPtr, tilingDataPtr);
     tilingDataPtr->tCubeTiling.usedCoreNum = tilingDataPtr->tileletInfo.computeCoreNum;
     size_t tilingDataSize = sizeof(TileletMatmulFp32TilingData);
-    auto ret = memcpy_s(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity(),
+    auto rawTilingData = context->GetRawTilingData();
+    OP_CHECK_IF(rawTilingData == nullptr, OP_LOGE(context->GetNodeName(), "raw tiling data is null"),
+                return ge::GRAPH_FAILED);
+    OP_LOGI(context->GetNodeName(), "tilelet tiling data size:%zu raw capacity:%zu", tilingDataSize,
+            rawTilingData->GetCapacity());
+    auto ret = memcpy_s(rawTilingData->GetData(), rawTilingData->GetCapacity(),
                         reinterpret_cast<void*>(tilingDataPtr), tilingDataSize);
     if (ret != EOK) {
         OP_LOGE(context->GetNodeName(), "memcpy_s failed, ret=%d", ret);
         return ge::GRAPH_FAILED;
     }
-    context->GetRawTilingData()->SetDataSize(tilingDataSize);
+    rawTilingData->SetDataSize(tilingDataSize);
     context->SetBlockDim(tilingDataPtr->tileletInfo.totalCoreNum);
     context->SetScheduleMode(1);
     // 生成tilingkey
-    uint64_t tilingKey = GET_TPL_TILING_KEY(FULL_LOAD_TYPE, TILELET_MATMUL_FP32_BASE_SPLIT_K, TILELET_MATMUL_FP32_BASE_FIXOPTI,
+    const uint32_t dtypeKey = ToTplDataType(argsPtr->aType);
+    uint64_t tilingKey = GET_TPL_TILING_KEY(dtypeKey, FULL_LOAD_TYPE, TILELET_MATMUL_FP32_BASE_SPLIT_K,
+                                            TILELET_MATMUL_FP32_BASE_FIXOPTI,
                                             TILELET_MATMUL_FP32_MIXND2NZ_TRUE);
-    OP_LOGI(context->GetNodeName(), "Tiling Key is 0x%x", tilingKey);
+    OP_LOGI(context->GetNodeName(), "Tiling Key is 0x%lx", tilingKey);
     context->SetTilingKey(tilingKey);
     return ge::GRAPH_SUCCESS;
 }
@@ -498,8 +572,7 @@ static ge::graphStatus TileletMatmulFp32TilingFunc(gert::TilingContext* context)
     }
 
     // 2.3 计算Tiling参数
-    TileletMatmulFp32TilingData* tilingDataPtr = context->GetTilingData<TileletMatmulFp32TilingData>();
-    OP_CHECK_NULL_WITH_CONTEXT(context, tilingDataPtr);
+    auto tilingDataPtr = std::make_unique<TileletMatmulFp32TilingData>();
     auto runInfoPtr = std::make_unique<TileletMatmulFp32RunInfo>();
     ret = DoOpTiling(tilingDataPtr->tCubeTiling, compileInfoPtr.get(), argsPtr.get(), runInfoPtr.get());
     if (ret != ge::GRAPH_SUCCESS) {
@@ -507,13 +580,13 @@ static ge::graphStatus TileletMatmulFp32TilingFunc(gert::TilingContext* context)
     }
 
     // 2.4 设置TillingData与生成tilingkey
-    ret = PostTiling(context, compileInfoPtr.get(), tilingDataPtr, argsPtr.get(), runInfoPtr.get());
+    ret = PostTiling(context, compileInfoPtr.get(), tilingDataPtr.get(), argsPtr.get(), runInfoPtr.get());
     if (ret != ge::GRAPH_SUCCESS) {
         return ret;
     }
 
     // 2.5设置workspaceSize
-    GetWorkspaceSize(context, tilingDataPtr);
+    GetWorkspaceSize(context, tilingDataPtr.get());
     return ge::GRAPH_SUCCESS;
 }
 

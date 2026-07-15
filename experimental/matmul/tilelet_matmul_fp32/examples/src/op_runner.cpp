@@ -321,17 +321,21 @@ bool OpRunner::RunOp()
     INFO_LOG("Create stream success");
 
     size_t workspaceSize = 0;
-    bool transposeX1 = false;
-    bool transposeX2 = false;
+    bool transposeX1 = GetEnvInt64("TILELET_TRANSPOSE_X1", 0) != 0;
+    bool transposeX2 = GetEnvInt64("TILELET_TRANSPOSE_X2", 0) != 0;
     int64_t remoteTileStart = GetEnvInt64("TILELET_REMOTE_TILE_START", 2);
     int64_t remoteTileCount = GetEnvInt64("TILELET_REMOTE_TILE_COUNT", 2);
-    int64_t wavefrontM = GetEnvInt64("TILELET_WAVEFRONT_M", 2);
-    int64_t wavefrontN = GetEnvInt64("TILELET_WAVEFRONT_N", 2);
-    int64_t commCoreNum = GetEnvInt64("TILELET_COMM_CORE_NUM", 2);
+    int64_t wavefrontM = GetEnvInt64("TILELET_WAVEFRONT_M", 16);
+    int64_t wavefrontN = GetEnvInt64("TILELET_WAVEFRONT_N", 8);
+    int64_t commCoreNum = GetEnvInt64("TILELET_COMM_CORE_NUM", GetEnvInt64("TILELET_COMM_SMS", 8));
+    int64_t commKTiles = GetEnvInt64("TILELET_COMM_K_TILES", 32);
+    bool enableDCopyback = GetEnvInt64("TILELET_ENABLE_D_COPYBACK", GetEnvInt64("TILELET_D_COPYBACK", 0)) != 0;
+    const aclTensor* biasTensor = numInputs_ > 2 ? inputTensor_[2] : nullptr;
     aclOpExecutor* handle = nullptr;
-    auto ret = aclnnTileletMatmulFp32GetWorkspaceSize(inputTensor_[0], inputTensor_[1], inputTensor_[2], transposeX1,
+    auto ret = aclnnTileletMatmulFp32GetWorkspaceSize(inputTensor_[0], inputTensor_[1], biasTensor, transposeX1,
                                                transposeX2, remoteTileStart, remoteTileCount, wavefrontM, wavefrontN,
-                                               commCoreNum, outputTensor_[0], &workspaceSize, &handle);
+                                               commCoreNum, commKTiles, enableDCopyback, outputTensor_[0],
+                                               &workspaceSize, &handle);
     if (ret != ACL_SUCCESS) {
         (void)aclrtDestroyStream(stream);
         ERROR_LOG("Get Operator Workspace failed. error code is %d", static_cast<int32_t>(ret));

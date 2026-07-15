@@ -43,8 +43,10 @@ private:
     __aicore__ inline bool WavefrontHasRemoteTile(uint64_t wfIndex) const;
     __aicore__ inline bool IsDirectDWavefront(uint64_t wfIndex) const;
     __aicore__ inline uint64_t SignalCount() const;
+    __aicore__ inline uint64_t AbSignalCount() const;
+    __aicore__ inline uint64_t AbSignalIndex(uint64_t sigIndex, uint64_t kGroup) const;
     __aicore__ inline uint64_t InitSignalIndex() const;
-    __aicore__ inline uint64_t AbCompletionIndex(uint64_t sigIndex, uint64_t coreIdx) const;
+    __aicore__ inline uint64_t AbCompletionIndex(uint64_t sigIndex, uint64_t kGroup, uint64_t coreIdx) const;
     __aicore__ inline uint64_t DCopyDoneIndex(uint64_t wfIndex, uint64_t coreIdx) const;
     __aicore__ inline uint64_t SignalForA(uint64_t wfRow) const;
     __aicore__ inline uint64_t SignalForB(uint64_t wfCol) const;
@@ -64,7 +66,7 @@ private:
     __aicore__ inline void ProcessComputeCore(uint64_t computeIdx, uint8_t enAtomic);
     __aicore__ inline void ProcessComputeCoreDirect(uint64_t computeIdx, uint8_t enAtomic);
     __aicore__ inline void ProcessComputeCoreRemote(uint64_t computeIdx);
-    __aicore__ inline void CopySignalAB(uint64_t sigIndex, uint64_t coreIdx);
+    __aicore__ inline void CopySignalAB(uint64_t sigIndex, uint64_t kGroup, uint64_t coreIdx);
     __aicore__ inline void ComputeDirectTile(uint64_t mTile, uint64_t nTile, uint8_t enAtomic);
     __aicore__ inline void ComputeRemoteTile(uint64_t wfIndex, uint64_t localM, uint64_t localN, uint64_t mTile,
                                              uint64_t nTile);
@@ -151,7 +153,7 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
                                  block_.matmulFp32TilingData_->tCubeTiling.N);
     biasGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(biasGM), block_.matmulFp32TilingData_->tCubeTiling.N);
     __gm__ uint8_t* userWorkspace = reinterpret_cast<__gm__ uint8_t*>(workspaceGM);
-    const uint64_t abSignalCount = SignalCount();
+    const uint64_t abSignalCount = AbSignalCount();
     const uint64_t abSignalSlots = abSignalCount + 1 + abSignalCount * tilelet.commCoreNum;
     const uint64_t dSignalSlots = tilelet.compactTileSlots +
                                   static_cast<uint64_t>(tilelet.wavefrontCount) * tilelet.commCoreNum;
@@ -339,6 +341,9 @@ TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CF
     if (tilelet.commCoreNum == 0 || tilelet.remoteTileEnd <= tilelet.remoteTileStart) {
         return false;
     }
+    if (tilelet.enableDCopyback == 0) {
+        return true;
+    }
     const uint64_t slotsPerWavefront = static_cast<uint64_t>(tilelet.wavefrontM) * tilelet.wavefrontN;
     return wfIndex == (static_cast<uint64_t>(tilelet.remoteTileEnd) - 1) / slotsPerWavefront;
 }
@@ -355,19 +360,40 @@ TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CF
 template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG,
           class MM_CB>
 __aicore__ inline uint64_t
+TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG, MM_CB>::AbSignalCount() const
+{
+    const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
+    const uint64_t kGroupCount = tilelet.kGroupCount == 0 ? 1 : static_cast<uint64_t>(tilelet.kGroupCount);
+    return SignalCount() * kGroupCount;
+}
+
+template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG,
+          class MM_CB>
+__aicore__ inline uint64_t
+TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG, MM_CB>::AbSignalIndex(
+    uint64_t sigIndex, uint64_t kGroup) const
+{
+    const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
+    const uint64_t kGroupCount = tilelet.kGroupCount == 0 ? 1 : static_cast<uint64_t>(tilelet.kGroupCount);
+    return sigIndex * kGroupCount + kGroup;
+}
+
+template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG,
+          class MM_CB>
+__aicore__ inline uint64_t
 TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG, MM_CB>::InitSignalIndex() const
 {
-    return SignalCount();
+    return AbSignalCount();
 }
 
 template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG,
           class MM_CB>
 __aicore__ inline uint64_t TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG,
-                                                       MM_CB>::AbCompletionIndex(uint64_t sigIndex,
+                                                       MM_CB>::AbCompletionIndex(uint64_t sigIndex, uint64_t kGroup,
                                                                                  uint64_t coreIdx) const
 {
     const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
-    return SignalCount() + 1 + sigIndex * tilelet.commCoreNum + coreIdx;
+    return AbSignalCount() + 1 + AbSignalIndex(sigIndex, kGroup) * tilelet.commCoreNum + coreIdx;
 }
 
 template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE, const MatmulConfig& MM_CFG,
@@ -452,7 +478,10 @@ TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CF
     const uint64_t sigA = SignalForA(wfRow);
     const uint64_t sigB = SignalForB(wfCol);
     const uint64_t waitSig = sigA > sigB ? sigA : sigB;
-    while (ReadSignal(abSignalGlobal_, waitSig) == 0) {
+    const uint64_t kGroupCount = tilelet.kGroupCount == 0 ? 1 : static_cast<uint64_t>(tilelet.kGroupCount);
+    for (uint64_t group = 0; group < kGroupCount; ++group) {
+        while (ReadSignal(abSignalGlobal_, AbSignalIndex(waitSig, group)) == 0) {
+        }
     }
 }
 
@@ -534,11 +563,14 @@ TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CF
 {
     const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
     const uint64_t abSignalCount = SignalCount();
+    const uint64_t kGroupCount = tilelet.kGroupCount == 0 ? 1 : static_cast<uint64_t>(tilelet.kGroupCount);
     WriteSignal(abSignalGlobal_, InitSignalIndex(), 0);
     for (uint64_t sig = 0; sig < abSignalCount; ++sig) {
-        WriteSignal(abSignalGlobal_, sig, 0);
-        for (uint64_t core = 0; core < tilelet.commCoreNum; ++core) {
-            WriteSignal(abSignalGlobal_, AbCompletionIndex(sig, core), 0);
+        for (uint64_t group = 0; group < kGroupCount; ++group) {
+            WriteSignal(abSignalGlobal_, AbSignalIndex(sig, group), 0);
+            for (uint64_t core = 0; core < tilelet.commCoreNum; ++core) {
+                WriteSignal(abSignalGlobal_, AbCompletionIndex(sig, group, core), 0);
+            }
         }
     }
     for (uint64_t slot = 0; slot < tilelet.compactTileSlots; ++slot) {
@@ -568,19 +600,22 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
 {
     const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
     const uint64_t abSignalCount = SignalCount();
+    const uint64_t kGroupCount = tilelet.kGroupCount == 0 ? 1 : static_cast<uint64_t>(tilelet.kGroupCount);
     for (uint64_t sig = 0; sig < abSignalCount; ++sig) {
         if (!SignalNeededForRemoteTiles(sig)) {
             continue;
         }
-        CopySignalAB(sig, coreIdx);
-        PipeBarrier<PIPE_ALL>();
-        WriteSignal(abSignalGlobal_, AbCompletionIndex(sig, coreIdx), 1);
-        if (coreIdx == 0) {
-            for (uint64_t core = 0; core < tilelet.commCoreNum; ++core) {
-                while (ReadSignal(abSignalGlobal_, AbCompletionIndex(sig, core)) == 0) {
+        for (uint64_t group = 0; group < kGroupCount; ++group) {
+            CopySignalAB(sig, group, coreIdx);
+            PipeBarrier<PIPE_ALL>();
+            WriteSignal(abSignalGlobal_, AbCompletionIndex(sig, group, coreIdx), 1);
+            if (coreIdx == 0) {
+                for (uint64_t core = 0; core < tilelet.commCoreNum; ++core) {
+                    while (ReadSignal(abSignalGlobal_, AbCompletionIndex(sig, group, core)) == 0) {
+                    }
                 }
+                WriteSignal(abSignalGlobal_, AbSignalIndex(sig, group), 1);
             }
-            WriteSignal(abSignalGlobal_, sig, 1);
         }
     }
 }
@@ -591,6 +626,9 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
                                                    MM_CB>::ProcessCommCopyBack(uint64_t coreIdx)
 {
     const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
+    if (tilelet.enableDCopyback == 0) {
+        return;
+    }
     for (uint64_t wf = 0; wf < tilelet.wavefrontCount; ++wf) {
         if (!WavefrontHasRemoteTile(wf) || IsDirectDWavefront(wf)) {
             continue;
@@ -697,12 +735,21 @@ template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK
           class MM_CB>
 __aicore__ inline void
 TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CFG, MM_CB>::CopySignalAB(
-    uint64_t sigIndex, uint64_t coreIdx)
+    uint64_t sigIndex, uint64_t kGroup, uint64_t coreIdx)
 {
     const TileletMatmulFp32TileletInfo& tilelet = block_.matmulFp32TilingData_->tileletInfo;
     const TCubeTiling& tiling = block_.matmulFp32TilingData_->tCubeTiling;
     const uint64_t tileM = tiling.singleCoreM;
     const uint64_t tileN = tiling.singleCoreN;
+    const bool transB = block_.matmulFp32TilingData_->matmulFp32RunInfo.transB != 0;
+    const uint64_t baseK = tiling.baseK == 0 ? 1 : static_cast<uint64_t>(tiling.baseK);
+    const uint64_t commKTiles = tilelet.commKTiles == 0 ? 32 : static_cast<uint64_t>(tilelet.commKTiles);
+    const uint64_t kTileCount = (static_cast<uint64_t>(tiling.Ka) + baseK - 1) / baseK;
+    const uint64_t kTileBegin = kGroup * commKTiles;
+    const uint64_t kTileEnd = Min(kTileBegin + commKTiles, kTileCount);
+    const uint64_t kBegin = Min(kTileBegin * baseK, static_cast<uint64_t>(tiling.Ka));
+    const uint64_t kEnd = Min(kTileEnd * baseK, static_cast<uint64_t>(tiling.Ka));
+    const uint64_t kSpan = kEnd > kBegin ? kEnd - kBegin : 0;
     uint64_t wfRow = 0;
     uint64_t wfCol = 0;
     SignalOrigin(sigIndex, wfRow, wfCol);
@@ -713,15 +760,21 @@ TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, BLOCK_TYPE, MM_CF
     const uint64_t nSpan = nStart >= tiling.N ? 0 : Min(static_cast<uint64_t>(tiling.N) - nStart,
                                                         static_cast<uint64_t>(tilelet.wavefrontN) * tileN);
     const uint64_t wfNStride = static_cast<uint64_t>(tilelet.wavefrontN) * tileN;
+    const uint64_t bStageStride = tilelet.enableDCopyback == 0 ? static_cast<uint64_t>(tiling.N) : wfNStride;
     if (wfCol == 0) {
         const uint64_t aBase = wfRow * tilelet.aSlabElements;
-        CopyGmRangePart(aStageGlobal_, aBase, aGlobal_, mStart * tiling.Ka, mSpan * tiling.Ka, coreIdx,
-                        tilelet.commCoreNum);
+        CopyGm2DPart(aStageGlobal_, aBase + kBegin, tiling.Ka, aGlobal_, mStart * tiling.Ka + kBegin, tiling.Ka,
+                     mSpan, kSpan, coreIdx, tilelet.commCoreNum);
     }
     if (wfRow == 0) {
         const uint64_t bBase = wfCol * tilelet.bSlabElements;
-        CopyGm2DPart(bStageGlobal_, bBase, wfNStride, bGlobal_, nStart, tiling.N, tiling.Ka, nSpan, coreIdx,
-                     tilelet.commCoreNum);
+        if (transB) {
+            CopyGm2DPart(bStageGlobal_, bBase + kBegin, tiling.Kb, bGlobal_, nStart * tiling.Kb + kBegin,
+                         tiling.Kb, nSpan, kSpan, coreIdx, tilelet.commCoreNum);
+        } else {
+            CopyGm2DPart(bStageGlobal_, bBase + kBegin * bStageStride, bStageStride, bGlobal_,
+                         kBegin * tiling.N + nStart, tiling.N, kSpan, nSpan, coreIdx, tilelet.commCoreNum);
+        }
     }
 }
 
@@ -738,11 +791,13 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
     const uint64_t nStart = nTile * tileN;
     const uint64_t mUse = Min(tileM, static_cast<uint64_t>(tiling.M) - mStart);
     const uint64_t nUse = Min(tileN, static_cast<uint64_t>(tiling.N) - nStart);
+    const bool transB = block_.matmulFp32TilingData_->matmulFp32RunInfo.transB != 0;
+    const uint64_t bOffset = transB ? nStart * tiling.Kb : nStart;
 
     mm_.SetOrgShape(tiling.M, tiling.N, tiling.Ka, tiling.Kb, tiling.N);
     mm_.SetSingleShape(mUse, nUse, tiling.singleCoreK);
     mm_.SetTensorA(aGlobal_[mStart * tiling.Ka], false);
-    mm_.SetTensorB(bGlobal_[nStart], false);
+    mm_.SetTensorB(bGlobal_[bOffset], transB);
     if (tiling.isBias) {
         mm_.SetBias(biasGlobal_[nStart]);
     }
@@ -768,15 +823,17 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
     const uint64_t wfNStride = static_cast<uint64_t>(tilelet.wavefrontN) * tileN;
     const uint64_t wfRow = wfIndex / tilelet.wavefrontCols;
     const uint64_t wfCol = wfIndex - wfRow * tilelet.wavefrontCols;
+    const bool transB = block_.matmulFp32TilingData_->matmulFp32RunInfo.transB != 0;
     const uint64_t aOffset = wfRow * tilelet.aSlabElements + localM * tileM * tiling.Ka;
-    const uint64_t bOffset = wfCol * tilelet.bSlabElements + localN * tileN;
+    const uint64_t bOffset =
+        wfCol * tilelet.bSlabElements + (transB ? localN * tileN * tiling.Kb : localN * tileN);
     const uint64_t dOffset =
         wfIndex * tilelet.dSlabElements + localM * tileM * wfNStride + localN * tileN;
 
     mm_.SetOrgShape(static_cast<uint64_t>(tilelet.wavefrontM) * tileM, wfNStride, tiling.Ka, tiling.Kb, wfNStride);
     mm_.SetSingleShape(mUse, nUse, tiling.singleCoreK);
     mm_.SetTensorA(aStageGlobal_[aOffset], false);
-    mm_.SetTensorB(bStageGlobal_[bOffset], false);
+    mm_.SetTensorB(bStageGlobal_[bOffset], transB);
     if (tiling.isBias) {
         mm_.SetBias(biasGlobal_[nStart]);
     }
@@ -799,16 +856,17 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
     const uint64_t nStart = nTile * tileN;
     const uint64_t mUse = Min(tileM, static_cast<uint64_t>(tiling.M) - mStart);
     const uint64_t nUse = Min(tileN, static_cast<uint64_t>(tiling.N) - nStart);
-    const uint64_t wfNStride = static_cast<uint64_t>(tilelet.wavefrontN) * tileN;
     const uint64_t wfRow = wfIndex / tilelet.wavefrontCols;
     const uint64_t wfCol = wfIndex - wfRow * tilelet.wavefrontCols;
+    const bool transB = block_.matmulFp32TilingData_->matmulFp32RunInfo.transB != 0;
     const uint64_t aOffset = wfRow * tilelet.aSlabElements + localM * tileM * tiling.Ka;
-    const uint64_t bOffset = wfCol * tilelet.bSlabElements + localN * tileN;
+    const uint64_t bOffset =
+        wfCol * tilelet.bSlabElements + (transB ? localN * tileN * tiling.Kb : localN * tileN);
 
-    mm_.SetOrgShape(static_cast<uint64_t>(tilelet.wavefrontM) * tileM, wfNStride, tiling.Ka, tiling.Kb, wfNStride);
+    mm_.SetOrgShape(static_cast<uint64_t>(tilelet.wavefrontM) * tileM, tiling.N, tiling.Ka, tiling.Kb, tiling.N);
     mm_.SetSingleShape(mUse, nUse, tiling.singleCoreK);
     mm_.SetTensorA(aStageGlobal_[aOffset], false);
-    mm_.SetTensorB(bStageGlobal_[bOffset], false);
+    mm_.SetTensorB(bStageGlobal_[bOffset], transB);
     if (tiling.isBias) {
         mm_.SetBias(biasGlobal_[nStart]);
     }
@@ -938,35 +996,8 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
         return;
     }
 
-    constexpr uint32_t elemPerBlock = ONE_BLK_SIZE / sizeof(T);
-    constexpr uint32_t maxElems = TILELET_MATMUL_FP32_COPY_UB_BYTES / sizeof(T);
-    const uint64_t rowAlignedElems = ((rowElems + elemPerBlock - 1) / elemPerBlock) * elemPerBlock;
-    if (rowAlignedElems == 0 || rowAlignedElems > maxElems) {
-        for (uint64_t row = 0; row < rows; ++row) {
-            CopyGmRange(dst, dstOffset + row * dstRowStride, src, srcOffset + row * srcRowStride, rowElems);
-        }
-        return;
-    }
-
-    LocalTensor<T> local = copyBuf_.template Get<T>();
-    const uint32_t rowBytes = static_cast<uint32_t>(rowElems * sizeof(T));
-    const uint32_t rowAlignedBytes = static_cast<uint32_t>(rowAlignedElems * sizeof(T));
-    const uint32_t rightPad = static_cast<uint32_t>(rowAlignedElems - rowElems);
-    const uint32_t srcGapBytes = static_cast<uint32_t>((srcRowStride - rowElems) * sizeof(T));
-    const uint32_t dstGapBytes = static_cast<uint32_t>((dstRowStride - rowElems) * sizeof(T));
-    const uint32_t ubGapBlocks = (rowAlignedBytes - rowBytes) / ONE_BLK_SIZE;
-    const uint64_t maxRows = maxElems / rowAlignedElems;
-    uint64_t row = 0;
-    while (row < rows) {
-        const uint64_t currentRows = Min(maxRows, rows - row);
-        DataCopyExtParams inParams{static_cast<uint16_t>(currentRows), rowBytes, srcGapBytes, ubGapBlocks, 0};
-        DataCopyPadExtParams<T> padParams{rightPad != 0, 0, static_cast<uint8_t>(rightPad), static_cast<T>(0)};
-        DataCopyPad(local, src[srcOffset + row * srcRowStride], inParams, padParams);
-        PipeBarrier<PIPE_ALL>();
-        DataCopyExtParams outParams{static_cast<uint16_t>(currentRows), rowBytes, ubGapBlocks, dstGapBytes, 0};
-        DataCopyPad(dst[dstOffset + row * dstRowStride], local, outParams);
-        PipeBarrier<PIPE_ALL>();
-        row += currentRows;
+    for (uint64_t row = 0; row < rows; ++row) {
+        CopyGmRange(dst, dstOffset + row * dstRowStride, src, srcOffset + row * srcRowStride, rowElems);
     }
 }
 

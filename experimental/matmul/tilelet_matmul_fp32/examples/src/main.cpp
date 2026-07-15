@@ -17,7 +17,9 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
+#include <string>
 
 #include "acl/acl.h"
 #include "common.h"
@@ -26,23 +28,38 @@
 bool g_isDevice = false;
 int deviceId = 0;
 
+namespace {
+bool GetEnvFlag(const char* name, bool defaultValue = false)
+{
+    const char* value = std::getenv(name);
+    return value == nullptr ? defaultValue : std::strtoll(value, nullptr, 10) != 0;
+}
+
+bool IsBf16()
+{
+    const char* value = std::getenv("TILELET_DTYPE");
+    return value != nullptr && std::string(value) == "bf16";
+}
+} // namespace
+
 OperatorDesc CreateOpDesc()
 {
     // define operator
+    bool transposeX2 = GetEnvFlag("TILELET_TRANSPOSE_X2");
+    bool useBias = GetEnvFlag("TILELET_USE_BIAS", true);
     std::vector<int64_t> shapeA{256, 64};
-    std::vector<int64_t> shapeB{64, 512};
+    std::vector<int64_t> shapeB = transposeX2 ? std::vector<int64_t>{512, 64} : std::vector<int64_t>{64, 512};
     std::vector<int64_t> shapeBias{512};
     std::vector<int64_t> shapeC{256, 512};
-    aclDataType dataTypeA = ACL_FLOAT;
-    aclDataType dataTypeB = ACL_FLOAT;
-    aclDataType dataTypeBias = ACL_FLOAT;
-    aclDataType dataTypeC = ACL_FLOAT;
+    aclDataType dataType = IsBf16() ? ACL_BF16 : ACL_FLOAT;
     aclFormat format = ACL_FORMAT_ND;
     OperatorDesc opDesc;
-    opDesc.AddInputTensorDesc(dataTypeA, shapeA.size(), shapeA.data(), format);
-    opDesc.AddInputTensorDesc(dataTypeB, shapeB.size(), shapeB.data(), format);
-    opDesc.AddInputTensorDesc(dataTypeBias, shapeBias.size(), shapeBias.data(), format);
-    opDesc.AddOutputTensorDesc(dataTypeC, shapeC.size(), shapeC.data(), format);
+    opDesc.AddInputTensorDesc(dataType, shapeA.size(), shapeA.data(), format);
+    opDesc.AddInputTensorDesc(dataType, shapeB.size(), shapeB.data(), format);
+    if (useBias) {
+        opDesc.AddInputTensorDesc(dataType, shapeBias.size(), shapeBias.data(), format);
+    }
+    opDesc.AddOutputTensorDesc(dataType, shapeC.size(), shapeC.data(), format);
     return opDesc;
 }
 
@@ -51,7 +68,9 @@ bool SetInputData(OpRunner& runner)
     size_t fileSize = 0;
     ReadFile("../input/input_a.bin", fileSize, runner.GetInputBuffer<void>(0), runner.GetInputSize(0));
     ReadFile("../input/input_b.bin", fileSize, runner.GetInputBuffer<void>(1), runner.GetInputSize(1));
-    ReadFile("../input/input_bias.bin", fileSize, runner.GetInputBuffer<void>(2), runner.GetInputSize(2));
+    if (runner.NumInputs() > 2) {
+        ReadFile("../input/input_bias.bin", fileSize, runner.GetInputBuffer<void>(2), runner.GetInputSize(2));
+    }
     INFO_LOG("Set input success");
     return true;
 }
