@@ -92,3 +92,29 @@ target_link_libraries(execute_tilelet_matmul_fp32_op
 )
 
 install(TARGETS execute_tilelet_matmul_fp32_op DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+
+# Two-card ("peer 直存") gate test driver. Self-contained: sets up two devices,
+# peer access and a shared arena, and runs the source/compute ranks cooperatively.
+add_executable(execute_tilelet_matmul_fp32_crosscard
+    ${OPS_NN_RESOURCE_CPP}
+    tilelet_static_resource_stub.cpp
+    main_crosscard.cpp
+)
+
+target_link_libraries(execute_tilelet_matmul_fp32_crosscard
+    ${OPS_NN_STATIC_LIB}
+    metadef
+    c_sec
+    opp_registry
+    register
+    ascendalog
+    tiling_api
+    platform
+    nnopbase
+    opapi_math
+    ascendcl
+    acl_op_compiler
+    stdc++
+)
+
+install(TARGETS execute_tilelet_matmul_fp32_crosscard DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})

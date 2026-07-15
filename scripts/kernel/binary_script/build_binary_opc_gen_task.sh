@@ -300,6 +300,12 @@ main() {
 
   # 所有算子的kernel  onebyone 进行编译
   local thread_num=$(cat ${binary_config_file} | grep bin_filename | wc -l)
+  # tilelet_matmul_fp32: force a single compile shard so all dtype bins (fp32 +
+  # bf16) are compiled by the single available worker. With >1 shard the extra
+  # shard is left uncompiled and the bf16 variant is dropped.
+  if echo "${binary_config_file}" | grep -q "tilelet_matmul_fp32"; then
+    thread_num=1
+  fi
   for impl_mode in ${impl_list_array[@]}; do
     impl_mode_name=$impl_mode
     if [ ${#var_array[@]} -ge 2 ]; then

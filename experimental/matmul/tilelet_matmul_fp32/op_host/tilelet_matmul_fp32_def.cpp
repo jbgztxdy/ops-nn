@@ -43,6 +43,27 @@ public:
             .FormatForBinQuery({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
             .AutoContiguous();
+        // Cross-card ("peer 直存") staging/signal arena. Peer-visible buffer
+        // shared between the source and compute ranks. When absent the op runs
+        // the original single-card path.
+        this->Input("arena")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .DataTypeForBinQuery({ge::DT_FLOAT, ge::DT_BF16})
+            .FormatForBinQuery({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .AutoContiguous();
+        // Compute rank only: base address of the source rank's output C, so
+        // remote tiles can be written back directly across the card link.
+        this->Input("peer_out")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .DataTypeForBinQuery({ge::DT_FLOAT, ge::DT_BF16})
+            .FormatForBinQuery({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .AutoContiguous();
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT, ge::DT_BF16})
@@ -60,6 +81,12 @@ public:
         this->Attr("comm_core_num").AttrType(OPTIONAL).Int(8);
         this->Attr("comm_k_tiles").AttrType(OPTIONAL).Int(32);
         this->Attr("enable_d_copyback").AttrType(OPTIONAL).Bool(false);
+        // Cross-card role: 0 = single-card/source, 1 = remote compute rank.
+        // rank_id/world_size are reserved for multi-rank scheduling; only role
+        // drives kernel behavior in the current peer-store implementation.
+        this->Attr("role").AttrType(OPTIONAL).Int(0);
+        this->Attr("rank_id").AttrType(OPTIONAL).Int(0);
+        this->Attr("world_size").AttrType(OPTIONAL).Int(1);
         this->AICore().AddConfig("ascend910b");
         this->AICore().AddConfig("ascend910_93");
     }

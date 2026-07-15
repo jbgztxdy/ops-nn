@@ -105,6 +105,9 @@ struct TileletMatmulFp32Args {
     int64_t commCoreNum = TILELET_DEFAULT_COMM_CORES;
     int64_t commKTiles = TILELET_DEFAULT_COMM_K_TILES;
     bool enableDCopyback = false;
+    int64_t role = 0;       // 0 = single-card/source, 1 = remote compute rank
+    int64_t rankId = 0;
+    int64_t worldSize = 1;
     ge::DataType aType = ge::DT_FLOAT;
     ge::DataType bType = ge::DT_FLOAT;
     ge::DataType cType = ge::DT_FLOAT;
@@ -238,6 +241,16 @@ static void InitTileletInfo(TileletMatmulFp32CompileInfo* compileInfoPtr, Tilele
             ? 0
             : AlignBytes(info.dSlabByteOffset + wavefrontCount * info.dSlabElements * elemSize, BASIC_ALIGN_512);
 
+    // Cross-card coordination. The shared peer-visible arena uses the exact same
+    // signal/slab layout as the single-card workspace, so both ranks agree on
+    // every offset for a given problem shape. arenaBytes tells the host driver
+    // how large the peer buffer must be.
+    info.role = static_cast<uint32_t>(argsPtr->role < 0 ? 0 : argsPtr->role);
+    info.rankId = static_cast<uint32_t>(argsPtr->rankId < 0 ? 0 : argsPtr->rankId);
+    info.worldSize = static_cast<uint32_t>(argsPtr->worldSize < 1 ? 1 : argsPtr->worldSize);
+    info.reserved = 0;
+    info.arenaBytes = info.userWorkspaceBytes;
+
     OP_LOGI(argsPtr->opName,
             "tilelet info tileM:%lu tileN:%lu wf:%lux%lu wfCnt:%lu slots:%lu remote:[%lu,%lu) comm:%lu "
             "commKTiles:%lu kGroups:%lu dCopyback:%d compute:%lu userWs:%lu",
@@ -301,6 +314,9 @@ static ge::graphStatus GetShapeAttrsInfo(gert::TilingContext* context, TileletMa
     const int64_t* commCoreNum = attrs->GetAttrPointer<int64_t>(6);
     const int64_t* commKTiles = attrs->GetAttrPointer<int64_t>(7);
     const bool* enableDCopyback = attrs->GetAttrPointer<bool>(8);
+    const int64_t* role = attrs->GetAttrPointer<int64_t>(9);
+    const int64_t* rankId = attrs->GetAttrPointer<int64_t>(10);
+    const int64_t* worldSize = attrs->GetAttrPointer<int64_t>(11);
     argsPtr->remoteTileStart = remoteTileStart == nullptr ? 0 : *remoteTileStart;
     argsPtr->remoteTileCount = remoteTileCount == nullptr ? 0 : *remoteTileCount;
     argsPtr->wavefrontM = wavefrontM == nullptr ? TILELET_DEFAULT_WAVEFRONT_M : *wavefrontM;
@@ -308,6 +324,9 @@ static ge::graphStatus GetShapeAttrsInfo(gert::TilingContext* context, TileletMa
     argsPtr->commCoreNum = commCoreNum == nullptr ? TILELET_DEFAULT_COMM_CORES : *commCoreNum;
     argsPtr->commKTiles = commKTiles == nullptr ? TILELET_DEFAULT_COMM_K_TILES : *commKTiles;
     argsPtr->enableDCopyback = enableDCopyback == nullptr ? false : *enableDCopyback;
+    argsPtr->role = role == nullptr ? 0 : *role;
+    argsPtr->rankId = rankId == nullptr ? 0 : *rankId;
+    argsPtr->worldSize = worldSize == nullptr ? 1 : *worldSize;
 
     // 输入、输出格式信息
     argsPtr->aFormat = static_cast<ge::Format>(ge::GetPrimaryFormat(descX1->GetStorageFormat()));
