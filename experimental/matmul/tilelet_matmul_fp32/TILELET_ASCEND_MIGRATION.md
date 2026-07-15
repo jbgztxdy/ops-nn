@@ -7,6 +7,17 @@
 `ops-nn/scripts/...`），**不要**写机器绝对路径。凡是临时目录，放在数据盘（大盘）下自建目录，
 不要用根分区 `/`（本机 `/` 已满，见"构建注意事项"）。
 
+## 命名说明（先读）
+
+算子名 `tilelet_matmul_fp32` 里的 `fp32` 是**历史命名**（fork 自 fp32 matmul 基座），**不代表只支持 fp32**：
+
+- 算子**同时支持 fp32 和 bf16**：`op_host/tilelet_matmul_fp32_def.cpp` 所有张量 dtype 为
+  `{ge::DT_FLOAT, ge::DT_BF16}`，构建会产出 fp32 与 bf16 两套 kernel bin。
+- **vLLM tilelet remote_linear 强制 bf16**：`vllm/vllm/tilelet.py` 里非 bf16 输入直接 fallback（`return "dtype"`），
+  模型 `Meta-Llama-3-8B` 走 bf16。故 **vLLM 相关精度就是 bf16**。
+- 本项目的跨卡验证**全部在 bf16 下完成**（即 vLLM 路径）；fp32 只是顺带保留的回归路径。
+- 不建议重命名（涉及目录 / op type / aclnn 接口，改动大、收益低），以本说明为准即可。
+
 ## 目标
 
 迁移目标不是普通 matmul，而是 vLLM disaggregated prefill benchmark 中使用的 tilelet remote linear
@@ -20,8 +31,8 @@ remote 计算结束后按配置直接写 D 或 copyback。benchmark 用的是 di
 - vLLM C++ binding：`vllm/csrc/tilelet/torch_bindings.cpp`。
 - CUDA tilelet copy/compute kernel：`tilelet-sched/cutlass/include/cutlass/gemm/device/tilelet_remote_copy.h`、
   `tilelet_remote_gemm.h`、`tilelet-sched/cutlass/include/cutlass/gemm/kernel/tilelet_gemm.h`。
-- CUDA 跨卡框架层（**未移植**，接入时要对照）：`tilelet-sched/src/tilelet_same_va_allocator.cu`、
-  `tilelet-sched/src/tilelet_multiprocess_gemm.cu`。
+- CUDA 跨卡框架层（Ascend 已完成单算子两 rank gate；完整 vLLM/框架编排层仍需接入时对照）：
+  `tilelet-sched/src/tilelet_same_va_allocator.cu`、`tilelet-sched/src/tilelet_multiprocess_gemm.cu`。
 - Ascend 迁移目标：`ops-nn/experimental/matmul/tilelet_matmul_fp32`。
 
 ## vLLM benchmark 使用的语义
@@ -122,7 +133,8 @@ ResetSignals），并在两卡各自 stream 上同步（省去 in-kernel D-done 
   在 compute 卡分配并清零 arena、在 source 卡分配 C；把 arena/peer_out 地址 + role 作为新输入/attr 传给两次
   aclnn 调用（dev0=source role0，dev1=compute role1）；并发 launch 后同步两 stream；读回 source 的 C 写
   `output_z.bin`。
-- 复用 `examples/scripts/gen_data.py` / `verify_result.py`（BF16 golden）。
+- 复用 `examples/scripts/gen_data.py` / `verify_result.py`（BF16 golden）；`gen_data.py` 支持
+  `TILELET_M/N/K`、`TILELET_DTYPE`、`TILELET_TRANSPOSE_X2`、`TILELET_USE_BIAS`。
 - CMake 里新增可执行 `execute_tilelet_matmul_fp32_crosscard`。
 - 顺带把单卡驱动 `examples/src/op_runner.cpp` 的 aclnn 调用改成新签名（arena/peer_out 传 nullptr，role=0）。
 
@@ -196,17 +208,17 @@ env TILELET_DTYPE=bf16 python3 scripts/verify_result.py output/output_z.bin outp
 
 ## 已跨卡验证（910B，仅正确性）
 
-两卡 gate（dev0=source / dev1=compute，BF16 / no-bias / transpose_x2 / comm_sms=8 / comm_k_tiles=32 /
-direct-D），`verify_result.py` 均 **error ratio 0.0000, test pass**：
+两卡 gate（dev0=source / dev1=compute，BF16 / no-bias / transpose_x2 / direct-D），`verify_result.py` 均
+**error ratio 0.0000, test pass**：
 
-- `remote=[2,4)`：source 本地算 tile 0,1 + compute 跨卡算 tile 2,3 并 peer 写回。
-- `remote=[0,4)`：全 offload，compute 算全部、source 只 staging。
-- `remote=[0,0)`：退化本地。
-- 强制多 wavefront：`wavefront=1x1`（4 个独立 wavefront）、`2x1`（跨列 `SignalForB`）——均 pass。
-- 强制多 K-group：`comm_k_tiles=1`——pass。
+- 默认目标配置：`M=256,N=512,K=64, remote=[2,4), comm_sms=8, comm_k_tiles=32`。
+- 多 wavefront：`M=2176,N=2304,K=8, remote=[0,384), wavefront=16x8, comm_sms=8, comm_k_tiles=32`，
+  覆盖 `sig0=A0+B0`、后续 A-row signal、后续 B-col signal，以及 source/compute 分工同时存在。
+- 多 K-group：`M=256,N=512,K=128, remote=[2,4), comm_sms=8, comm_k_tiles=1`。
+- 单卡目标配置也复核通过：`M=256,N=512,K=64, remote=[0,4), comm_sms=8, comm_k_tiles=32`。
 
 即：kernel 跨卡 `DataCopy`、跨卡 AB signal 轮询、compute 直写 source C 三者都成立；多 wavefront / 多 K-group
-的 copy 顺序与 signal 索引在跨卡下也正确（不只是单 wavefront 平凡情形）。
+的 copy 顺序与 signal 索引在跨卡下已做正确性覆盖（不只是单 wavefront 平凡情形）。
 
 ---
 
@@ -218,11 +230,11 @@ direct-D），`verify_result.py` 均 **error ratio 0.0000, test pass**：
    通信与计算 overlap 带来的提速，必须在 910C 真机 profiling：AIC timeline、HCCS 吞吐、comm core 与
    compute core 是否时间重叠、端到端 duration。
 
-2. **大 shape 跨卡实测**。只验证了 256×512×64（外加强制多 wavefront/K-group 的参数变体）。vLLM 真实 shape
-   很大（`scratch_max_m=16384`、`n=28672`、`k=28672`）。阻碍：`examples/scripts/gen_data.py` 的 golden 是
-   纯 Python 三重循环，大 shape 极慢——**先写一个快速 golden（numpy / 设备端参考）**，再放大 M/N/K
-   （`gen_data.py` 目前 M/N/K 硬编码在文件头，需要改成可配置），同时把 `main_crosscard.cpp` 里固定 512MB 的
-   arena 改为按算子报出的 `arenaBytes` 分配。
+2. **大 shape 跨卡实测**。已验证默认 256×512×64、强制多 wavefront 的 2176×2304×8、以及多 K-group 的
+   256×512×128（`comm_k_tiles=1`）。vLLM 真实 shape 仍大得多（`scratch_max_m=16384`、`n=28672`、
+   `k=28672`）。阻碍：`examples/scripts/gen_data.py` 的 golden 仍是纯 Python 三重循环，大 shape 极慢。
+   后续应先写一个快速 golden（numpy / 设备端参考），再放大 M/N/K，同时把 `main_crosscard.cpp` 里固定
+   512MB 的 arena 改为按算子报出的 `arenaBytes` 分配。
 
 3. **补齐 v1 相对 CUDA 的简化**（当前对 benchmark 路径功能等价，但不同构）：
    - **in-kernel 跨卡 D-done 轮询**：现在靠 host 同步两 stream；CUDA 是 compute rank 发 D-done、source 在

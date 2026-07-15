@@ -14,9 +14,14 @@ import os
 import struct
 
 
-M = 256
-N = 512
-K = 64
+def env_i64(name, default):
+    value = os.getenv(name)
+    return default if value is None else int(value)
+
+
+M = env_i64("TILELET_M", 256)
+N = env_i64("TILELET_N", 512)
+K = env_i64("TILELET_K", 64)
 
 
 def f32(value):
