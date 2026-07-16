@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -280,24 +281,47 @@ int main() {
 
   void* wsSrc = nullptr;
   void* wsCompute = nullptr;
-
-  // Launch source (dev0) and compute (dev1) concurrently, then sync both.
-  if (!Check(aclrtSetDevice(kSourceDevice), "setDevice src launch")) return 1;
   RankPlan src{tX1s, tX2s, tArena, /*peerOut=*/nullptr, tDsignalSrc, tCSource, /*role=*/0, /*rankId=*/0};
-  if (!LaunchRank(src, transX2, remoteStartUse, remoteCountUse, wfM, wfN, commCores, commKTiles, enableDCopyback,
-                  streamSrc, &wsSrc))
-    return 1;
-
-  if (!Check(aclrtSetDevice(kComputeDevice), "setDevice compute launch")) return 1;
   RankPlan cmp{tX1c, tX2c, tArena, tPeerOut, tDsignalCmp, tOutDummy, /*role=*/1, /*rankId=*/1};
-  if (!LaunchRank(cmp, transX2, remoteStartUse, remoteCountUse, wfM, wfN, commCores, commKTiles, enableDCopyback,
-                  streamCompute, &wsCompute))
-    return 1;
 
-  if (!Check(aclrtSetDevice(kSourceDevice), "setDevice src sync")) return 1;
-  if (!Check(aclrtSynchronizeStreamWithTimeout(streamSrc, 600000), "sync src")) return 1;
-  if (!Check(aclrtSetDevice(kComputeDevice), "setDevice compute sync")) return 1;
-  if (!Check(aclrtSynchronizeStreamWithTimeout(streamCompute, 600000), "sync compute")) return 1;
+  // Optional timed loop for perf measurement. TILELET_ITERS>1 runs the cooperative
+  // launch+sync repeatedly and prints avg ms (iter 0 is a warmup, excluded). Each
+  // iter re-zeroes the signal buffers for a fresh cross-card handshake and frees
+  // the per-call workspaces so they don't accumulate.
+  const int64_t iters = EnvI64("TILELET_ITERS", 1);
+  const size_t resetArena = kArenaBytes < (16UL << 20) ? kArenaBytes : (16UL << 20);  // covers ab/d signal slots
+  double totalMs = 0.0;
+  int timed = 0;
+  for (int64_t it = 0; it < iters; ++it) {
+    if (iters > 1) {  // reset signals (synchronous) before each timed launch
+      aclrtSetDevice(kComputeDevice); aclrtMemset(arena, resetArena, 0, resetArena);
+      aclrtSetDevice(kSourceDevice); aclrtMemset(dSignalSource, kDsignalBytes, 0, kDsignalBytes);
+    }
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (!Check(aclrtSetDevice(kSourceDevice), "setDevice src launch")) return 1;
+    if (!LaunchRank(src, transX2, remoteStartUse, remoteCountUse, wfM, wfN, commCores, commKTiles, enableDCopyback,
+                    streamSrc, &wsSrc))
+      return 1;
+    if (!Check(aclrtSetDevice(kComputeDevice), "setDevice compute launch")) return 1;
+    if (!LaunchRank(cmp, transX2, remoteStartUse, remoteCountUse, wfM, wfN, commCores, commKTiles, enableDCopyback,
+                    streamCompute, &wsCompute))
+      return 1;
+    if (!Check(aclrtSetDevice(kSourceDevice), "setDevice src sync")) return 1;
+    if (!Check(aclrtSynchronizeStreamWithTimeout(streamSrc, 600000), "sync src")) return 1;
+    if (!Check(aclrtSetDevice(kComputeDevice), "setDevice compute sync")) return 1;
+    if (!Check(aclrtSynchronizeStreamWithTimeout(streamCompute, 600000), "sync compute")) return 1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (iters == 1 || it > 0) { totalMs += ms; ++timed; }
+    if (wsSrc) { aclrtSetDevice(kSourceDevice); aclrtFree(wsSrc); wsSrc = nullptr; }
+    if (wsCompute) { aclrtSetDevice(kComputeDevice); aclrtFree(wsCompute); wsCompute = nullptr; }
+  }
+  if (iters > 1) {
+    printf("TIMING: avg %.3f ms over %d iters (M=%ld N=%ld K=%ld remote=[%ld,%ld) copyback=%d)\n",
+           totalMs / timed, timed, M, N, K, remoteStartUse, remoteStartUse + remoteCountUse,
+           static_cast<int>(enableDCopyback));
+  }
 
   // Read the assembled C back from the source card and dump for verify_result.py.
   std::vector<uint8_t> hostC(cBytes, 0);

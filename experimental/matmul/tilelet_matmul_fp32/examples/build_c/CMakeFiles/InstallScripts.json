@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/work/ops-nn/experimental/matmul/tilelet_matmul_fp32/examples/build_c/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

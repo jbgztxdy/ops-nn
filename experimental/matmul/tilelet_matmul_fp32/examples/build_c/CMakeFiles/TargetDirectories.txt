@@ -1,0 +1,9 @@
+/work/ops-nn/experimental/matmul/tilelet_matmul_fp32/examples/build_c/CMakeFiles/execute_tilelet_matmul_fp32_op.dir
+/work/ops-nn/experimental/matmul/tilelet_matmul_fp32/examples/build_c/CMakeFiles/execute_tilelet_matmul_fp32_crosscard.dir
+/work/ops-nn/experimental/matmul/tilelet_matmul_fp32/examples/build_c/CMakeFiles/execute_tilelet_matmul_fp32_crosscard_mp.dir
+/work/ops-nn/experimental/matmul/tilelet_matmul_fp32/examples/build_c/CMakeFiles/edit_cache.dir
+/work/ops-nn/experimental/matmul/tilelet_matmul_fp32/examples/build_c/CMakeFiles/rebuild_cache.dir
+/work/ops-nn/experimental/matmul/tilelet_matmul_fp32/examples/build_c/CMakeFiles/list_install_components.dir
+/work/ops-nn/experimental/matmul/tilelet_matmul_fp32/examples/build_c/CMakeFiles/install.dir
+/work/ops-nn/experimental/matmul/tilelet_matmul_fp32/examples/build_c/CMakeFiles/install/local.dir
+/work/ops-nn/experimental/matmul/tilelet_matmul_fp32/examples/build_c/CMakeFiles/install/strip.dir

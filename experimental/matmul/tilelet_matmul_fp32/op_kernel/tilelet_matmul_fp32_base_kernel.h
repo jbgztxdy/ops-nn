@@ -20,7 +20,10 @@
 using namespace AscendC;
 using namespace matmul;
 
-constexpr uint32_t TILELET_MATMUL_FP32_COPY_UB_BYTES = 16 * 1024;
+// Staging/copyback scratch in UB. Sized large (vs the original 16KB) so the
+// cross-card DataCopy moves big blocks per call instead of tiny per-row chunks —
+// this is the dominant cost of the cross-card A/B staging (see profiling notes).
+constexpr uint32_t TILELET_MATMUL_FP32_COPY_UB_BYTES = 128 * 1024;
 constexpr uint64_t TILELET_MATMUL_FP32_SIGNAL_WORD_STRIDE = 64 / sizeof(uint32_t);
 
 template <class A_TYPE, class B_TYPE, class C_TYPE, class BIAS_TYPE, class BLOCK_TYPE = TileletMatmulFp32BaseBlock,
@@ -1149,6 +1152,36 @@ __aicore__ inline void TileletMatmulFp32BaseKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_
     }
     if (rowElems == srcRowStride && rowElems == dstRowStride) {
         CopyGmRange(dst, dstOffset, src, srcOffset, rows * rowElems);
+        return;
+    }
+
+    // Strided 2D sub-block copy (e.g. a K-group column-band of A/B). Batch as many
+    // rows as fit in UB into ONE multi-block DataCopy (gather GM->UB, scatter
+    // UB->GM) instead of one DataCopy per row — the per-row path was the dominant
+    // cross-card staging cost. Requires each row to be 32B-aligned so blocks pack
+    // in UB; otherwise fall back to per-row (rare: a partial trailing K-group).
+    constexpr uint32_t elemPerBlock = ONE_BLK_SIZE / sizeof(T);
+    constexpr uint32_t maxElems = TILELET_MATMUL_FP32_COPY_UB_BYTES / sizeof(T);
+    if (rowElems % elemPerBlock == 0 && rowElems <= maxElems) {
+        const uint64_t rowsPerBatch = maxElems / rowElems;  // >= 1
+        LocalTensor<T> local = copyBuf_.template Get<T>();
+        const uint32_t blockLenBytes = static_cast<uint32_t>(rowElems * sizeof(T));
+        const uint32_t srcGapBytes = static_cast<uint32_t>((srcRowStride - rowElems) * sizeof(T));
+        const uint32_t dstGapBytes = static_cast<uint32_t>((dstRowStride - rowElems) * sizeof(T));
+        uint64_t row = 0;
+        while (row < rows) {
+            const uint16_t r = static_cast<uint16_t>(Min(rowsPerBatch, rows - row));
+            // Gather r rows from GM (stride srcRowStride) into UB packed contiguously.
+            DataCopyExtParams gather{r, blockLenBytes, srcGapBytes, 0, 0};
+            DataCopyPadExtParams<T> pad{false, 0, 0, static_cast<T>(0)};
+            DataCopyPad(local, src[srcOffset + row * srcRowStride], gather, pad);
+            PipeBarrier<PIPE_ALL>();
+            // Scatter the packed UB back to GM (stride dstRowStride).
+            DataCopyExtParams scatter{r, blockLenBytes, 0, dstGapBytes, 0};
+            DataCopyPad(dst[dstOffset + row * dstRowStride], local, scatter);
+            PipeBarrier<PIPE_ALL>();
+            row += r;
+        }
         return;
     }
 

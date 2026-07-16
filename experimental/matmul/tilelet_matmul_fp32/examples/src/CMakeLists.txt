@@ -69,6 +69,15 @@ link_directories(
     ${INC_PATH}/x86_64-linux/lib64
 )
 
+# CANN 9.0.0+ split logging into libunified_dlog.so, which libmetadef.so pulls in
+# transitively (symbol CheckLogLevel). Older CANN (e.g. 8.5.2) has no such split.
+# Link it only when present so the same CMakeLists builds on both.
+find_library(UNIFIED_DLOG_LIB unified_dlog
+    PATHS ${INC_PATH}/lib64 ${INC_PATH}/aarch64-linux/lib64 ${LIB_PATH})
+if(NOT UNIFIED_DLOG_LIB)
+    set(UNIFIED_DLOG_LIB "")
+endif()
+
 add_executable(execute_tilelet_matmul_fp32_op
     ${OPS_NN_RESOURCE_CPP}
     tilelet_static_resource_stub.cpp
@@ -91,6 +100,7 @@ target_link_libraries(execute_tilelet_matmul_fp32_op
     opapi_math
     ascendcl
     acl_op_compiler
+    ${UNIFIED_DLOG_LIB}
     stdc++
 )
 
@@ -117,6 +127,7 @@ target_link_libraries(execute_tilelet_matmul_fp32_crosscard
     opapi_math
     ascendcl
     acl_op_compiler
+    ${UNIFIED_DLOG_LIB}
     stdc++
 )
 
@@ -143,6 +154,7 @@ target_link_libraries(execute_tilelet_matmul_fp32_crosscard_mp
     opapi_math
     ascendcl
     acl_op_compiler
+    ${UNIFIED_DLOG_LIB}
     stdc++
 )
 
