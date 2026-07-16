@@ -274,13 +274,13 @@ env TILELET_DTYPE=bf16 python3 scripts/verify_result.py output/output_z.bin outp
 
 按优先级（勾选为本轮已处理）：
 
-1. **[仍缺-受限] 性能 / overlap 验证（最关键，910B 没做）**。目前只在低带宽 910B 验了**正确性**。tilelet 的
-   价值是通信与计算 overlap 带来的提速，必须在 910C 真机 profiling：AIC timeline、HCCS 吞吐、comm core 与
-   compute core 是否时间重叠、端到端 duration。**本轮受限于共享机 HBM 占满未做，需空闲卡。**
+1. **[仍缺-受限] 性能 / overlap 验证（最关键）**。tilelet 的价值是通信与计算 overlap 带来的提速，必须真机
+   profiling：AIC timeline、HCCS 吞吐、comm core 与 compute core 是否时间重叠、端到端 duration。**受限于共享机
+   HBM 占满未做，需空闲卡。操作见下「空闲卡上的 profiling 操作指南」+ `examples/scripts/profile_crosscard.sh`。**
 
-2. **[部分完成] 大 shape 跨卡实测**。✅ 已写快速 numpy golden、✅ arena 改为按 `arenaBytes` 动态分配。
-   ❌ vLLM 级大 shape（`scratch_max_m=16384`、`n=28672`、`k=28672`，arena≈3.3GB）实测仍缺——受限于共享机
-   HBM 占满（每 die 仅 ~3GB 空闲），需空闲卡。
+2. **[部分完成] 大 shape 跨卡实测**。✅ 已写快速 numpy golden、✅ arena 改为按 `arenaBytes` 动态分配、
+   ✅ 已写扫描脚本 `examples/scripts/sweep_large_shapes.sh`。❌ vLLM 级大 shape（`scratch_max_m=16384`、
+   `n=28672`、`k=28672`，arena≈3.3GB）实测仍缺——需空闲卡（每 die 需数 GB 空闲 HBM）。
 
 3. **补齐 v1 相对 CUDA 的简化**：
    - ✅ **in-kernel 跨卡 D-done 轮询（本轮完成）**：见上「第三阶段」。经可选输入 `peer_dsignal`（source 卡、
@@ -296,9 +296,63 @@ env TILELET_DTYPE=bf16 python3 scripts/verify_result.py output/output_z.bin outp
    `ClampRemoteCtasByRatio`/`ScheduleRemoteLinear`，`main_crosscard.cpp` 已接受 `TILELET_MIN/MAX_REMOTE_CTA_RATIO`
    并实测通过。框架接入时复用同一头。
 
-5. **框架接入层（非平凡）**。要跑进 Ascend vLLM，需要：peer 可见 arena 分配器 + 两 rank launch 编排
-   （对应 `tilelet_multiprocess_gemm.cu`）+ ratio→tile 映射 + peer access 使能 + 接到 `vllm/vllm/tilelet.py`
-   的 NPU `remote_linear`。这是一层真实框架代码，不是改几个参数。
+5. **[脚手架已搭，待硬件收尾] 框架接入层**。已在 `vllm-ascend` 里搭好接入脚手架（见
+   `vllm-ascend/csrc/tilelet/README.md`）：`csrc/tilelet/` 下的 IPC peer-arena 分配器（ACL IPC-mem key API +
+   `ENABLE_PEER_ACCESS`，即 CUDA same-VA allocator 的昇腾对应）、`tilelet_remote_linear{,_compute}` torch 算子
+   （调自定义 aclnn 算子 `aclnnTileletMatmulFp32`）、IPC key export/import/close 算子；`vllm_ascend/tilelet/`
+   下的 `maybe_tilelet_linear` 路由 + `TileletSession`（持久 scratch + rendezvous）+ ZMQ 控制通道 +
+   `tilelet_compute_serve`（decode 侧 role=1 服务循环）；`vllm_ascend/ops/linear.py` 的
+   `AscendUnquantizedLinearMethod.apply` 已插 fail-closed 钩子；`envs.py` 加了 `VLLM_ASCEND_TILELET_*` 开关。
+   已做无卡编译就绪检查（两个 adapter 头 `g++ -fsyntax-only` 过、aclnn 签名与生成头一致、`csrc` 加入 include 路径）。
+   **待空闲卡收尾**：首次完整编译、ZMQ 控制通道时延与 decode serve 循环的交错调优、以及端到端 PD benchmark 实测。
+   注：ratio→tile 已复用同一份 `tilelet_host_layout.h`（C++ 与 `vllm_ascend/tilelet/layout.py` 两份，已对齐）。
+
+# 空闲卡上的 profiling / 性能验证操作指南（交接）
+
+**这是迁移到有空闲卡的机器后最该做的事**（tilelet 的价值 = overlap 提速，目前只验了正确性、没验提速）。
+按序执行；速查清单见 `RESUME_ON_FREE_CARD.md`。**共享机注意**：跑完/被杀后务必
+`pkill -9 -f execute_tilelet_matmul_fp32`；跨进程测试用**专用 die**（脏 teardown 会在复用 die 上泄漏 IPC 注册）。
+
+## 0. 前置：构建
+按上文「构建与运行」用 `build.sh --static --experimental --soc=<对应 soc> --ops=tilelet_matmul_fp32` 出算子 +
+examples（910C 上 soc 为 `ascend910_93`，两处 910C 适配见「第三阶段」）。
+
+## 1. 已测的片间带宽（解读 profiling 的基准）
+910C 上用 `aclrtMemcpy` D2D（SDMA/copy-engine）实测的**单向**片间带宽：
+- **同封装两 die**（如 0↔1）：写 ~191 GB/s、读 ~202 GB/s；双向合计 ~327 GB/s。
+- **跨封装**（走 HCCS，如 0↔2）：写 ~138 GB/s、读 ~165 GB/s；双向合计 ~253 GB/s。
+- **IPC-import 的 peer buffer（我们实际用的机制）带宽与普通 peer 完全一致**（191.87 / 137.86 GB/s 写），
+  即 IPC-key vs CUDA same-VA **不损带宽**（差别只在地址空间，不在带宽）。
+- 参考：本地 HBM copy ~620 GB/s（≈1.2TB/s 有效），故跨 die 约为本地的 11–16%。
+
+结论：**PD 部署把 prefill die 与 compute(decode) die 放同一封装内**（0-1/2-3/…/6-7），带宽最优（比跨封装高 ~40%）。
+**注意**：以上是 SDMA 链路上限；tilelet kernel 实际走 **AIV `DataCopy` peer-store**，受同一链路约束但可能低于 SDMA 峰值——
+**这条 kernel 路径的带宽尚未单独测**（要么写个专用 kernel，要么在真算子 profiling 里看 HCCS 吞吐）。
+
+## 2. 单算子 overlap / 性能 profiling（第一优先级）
+用 `examples/scripts/profile_crosscard.sh`（msprof 封装，参数化 shape）：
+```
+cd experimental/matmul/tilelet_matmul_fp32/examples
+TILELET_M=4096 TILELET_N=4096 TILELET_K=4096 \
+TILELET_MIN_REMOTE_CTA_RATIO=0.0 TILELET_MAX_REMOTE_CTA_RATIO=0.4 \
+bash scripts/profile_crosscard.sh <srcDev> <cmpDev>
+```
+看 `output/msprof_result` 要回答的关键问题：
+- **AIV comm core 的拷贝是否与 AIC compute core 的 matmul 在时间上重叠**（tilelet 立身之本）；
+- **HCCS 实际吞吐** vs 上面的链路上限（判断是否被带宽卡住）；
+- **端到端 duration** vs 单卡全算基线（同脚本设 `TILELET_REMOTE_TILE_COUNT=0` 即不 offload，做对照）；
+- source(direct tiles) 与 compute(remote tiles) 两卡是否真并行。
+
+## 3. vLLM 级大 shape 正确性实测
+`bash examples/scripts/sweep_large_shapes.sh <srcDev> <cmpDev>`（含逼近 vLLM 的 shape；numpy golden 已快、arena 动态）。
+需两 die 各有数 GB 空闲 HBM。同时复核大 K 下 BF16 累加误差（唯一没法纯代码核对的点）。
+
+## 4. PD 分离 benchmark（真实提速）
+按 `vllm-ascend/csrc/tilelet/README.md`：装自定义算子包（`build.sh --pkg ...`）→ 重编 vllm-ascend →
+补齐并验证 ZMQ 控制通道 + decode serve 循环 → 同节点起两实例（prefill=source、decode=compute，
+`VLLM_ASCEND_TILELET_*`，两 die 同封装）→ 测 prefill TTFT/吞吐 vs `VLLM_ASCEND_TILELET_ENABLE=0`。
+
+---
 
 ## 与 CUDA tilelet 的逐行比对结论（2026-07 已完成）
 
@@ -334,6 +388,11 @@ env TILELET_DTYPE=bf16 python3 scripts/verify_result.py output/output_z.bin outp
    `output[M,N]`（`cGlobal_[mStart*N+nStart]`）。都产出正确 `output[M,N]`（golden 验证），设计上非逐字节可比。
 5. **数值累加/取整**：两边都 FP32 累加；epilogue 硬件不同（cube vs tensor core），容差内等价。
    **唯一仍需真机大 shape 复核**：大 K 累加误差（受限于共享机 HBM，见上）。
+
+**epilogue / 语义等价（2026-07 逐条核对）**：CUDA `remote_linear` 是**纯 GEMM**——`alpha=1.0`、
+`beta=0.0`（`torch_bindings.cpp:1029-1030`）、无融合 activation/scale、输出 `[*,N]` 行主序、仅在
+`bias=None` 时走 tilelet（`tilelet.py` 的 `_linear_eligibility_reason`）。Ascend 算子同为纯 matmul、
+无 alpha/beta 缩放、bias 可选但 vLLM 路径不传、输出行主序 `[M,N]`。→ **功能语义逐条等价**，无遗漏的融合/缩放。
 
 ## 接口一致性（算子设置 vs CUDA tilelet）
 
